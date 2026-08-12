@@ -1,0 +1,25 @@
+# GLORYPORT — Roadmap
+
+## Contexto
+
+Herramienta de escritorio solo Windows para listar puertos TCP en escucha y matar el proceso
+dueño desde la bandeja del sistema. Rust nativo, un binario, sin runtime. Fuente de decisión:
+[docs/arquitectura.md](docs/arquitectura.md).
+
+## Siguiente bloque ejecutable
+
+- **Validar v1 en uso real**: correr `gloryport tray` durante varios días, matar puertos en
+  proyectos diarios y registrar cualquier fricción (faltan PIDs, permisos, notificaciones).
+- **P5 — Puertos vigilados**: avisar por notificación cuando un puerto configurado aparece o
+  desaparece de la escucha (sin polling: solo al abrir el menú o en CLI `watch`).
+
+## Tareas pendientes (por prioridad)
+
+1. `128A-2` — P5: vigilancia de puertos configurados (config en `%APPDATA%\GLORYPORT`).
+2. `128A-3` — P6: instalador ligero (MSI/zip) y firma de código.
+3. `128A-4` — Mostrar línea de comando del proceso en el tooltip del menú (PID → cmdline).
+
+## Planes activos
+
+- [Plan GLORYPORT v1](Agente/planes/completados/plan-gloryport-2026-08-12.md) — cerrado
+  (evidencia en `Agente/completados/tareas-2026-08-12.md`).
