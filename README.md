@@ -98,7 +98,7 @@ Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso de
 
 | Chequeo | Resultado |
 |---|---|
-| `cargo test` | 23/23 OK (20 unit + 3 E2E con puerto real) |
+| `cargo test` | 20/20 OK (17 unit + 3 E2E con puerto real) |
 | `cargo clippy --all-targets -- -D warnings` | OK |
 | `cargo fmt --check` | OK |
 | Smoke bandeja | Icono en bandeja; clic físico abre el popup en ~25 ms, estable, 2.º clic cierra |

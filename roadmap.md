@@ -24,6 +24,9 @@ dueño desde la bandeja del sistema. Rust nativo, un binario, sin runtime. Fuent
    `CreateMutexW`/`FindWindowW` o reclamar cuando no exista ventana).
 6. `128A-8` — Mitigación de iconos fantasma en la bandeja tras cierres forzados del
    proceso (refresh del icono al arrancar y/o limpieza al detectar ventana muerta).
+7. `128A-9` — Observaciones del review de 128A-7: elipsis en la caja del PID del popup
+   (un PID largo puede recortarse visualmente) y declarar `rust-version` en `Cargo.toml`
+   (el código usa `is_none_or`, MSRV real 1.82+).
 
 ## Planes activos
 
