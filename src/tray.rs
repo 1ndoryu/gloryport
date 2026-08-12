@@ -250,7 +250,7 @@ unsafe fn show_menu(hwnd: HWND) {
         hmenu,
         MF_STRING,
         ID_REFRESH,
-        PCWSTR(w!("Actualizar (reescanea al abrir)").as_ptr()),
+        PCWSTR(w!("Actualizar lista").as_ptr()),
     );
     let autostart_flag = if autostart::is_enabled() {
         MF_CHECKED
@@ -303,7 +303,12 @@ unsafe fn show_and_run(hmenu: HMENU, hwnd: HWND, ports: Vec<PortInfo>) -> Result
     }
 
     match cmd {
-        ID_REFRESH => Ok(()),
+        // Re-escanea y reabre el menú al instante; el menú ya se reconstruye en
+        // cada apertura, pero este item permite refrescar sin cerrar y volver a abrir.
+        ID_REFRESH => {
+            show_menu(hwnd);
+            Ok(())
+        }
         ID_AUTOSTART => {
             let on = !autostart::is_enabled();
             match autostart::set_enabled(on) {

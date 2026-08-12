@@ -18,8 +18,8 @@ procesos hijos (`netstat`, `taskkill`, `reg.exe`), sin timers en background.
 - Auto-inicio opcional vía clave `Run` de HKCU (sin `reg.exe`).
 - Instancia única: una segunda copia notifica a la primera y sale sola.
 - CLI para scripting: `list` (tabla o JSON) y `kill <puerto>` con exit codes.
-- Bajo consumo: sin refresco automático, ~0 % CPU en reposo, ~2–10 MB de RAM en bandeja,
-  binario release de ~192 KB (0,19 MB).
+- Bajo consumo: sin refresco automático, ~0 % CPU en reposo, ~1,5–2,5 MB de RAM privada en
+  bandeja (WorkingSet ~10–17 MB según el sistema), binario release de ~192 KB (0,19 MB).
 
 ## Requisitos
 

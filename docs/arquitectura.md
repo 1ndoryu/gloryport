@@ -116,7 +116,7 @@ Reglas:
 
 Objetivos medibles (v1, verificados en §10):
 
-- RAM residente de la app en bandeja: < 10 MB.
+- RAM privada de la app en bandeja: < 3 MB (WorkingSet ~10–17 MB según el sistema).
 - Tamaño `gloryport.exe` release: < 1,5 MB.
 - `gloryport list` (escaneo + nombres): < 100 ms en máquina típica.
 

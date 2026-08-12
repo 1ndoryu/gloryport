@@ -18,6 +18,10 @@ dueño desde la bandeja del sistema. Rust nativo, un binario, sin runtime. Fuent
 1. `128A-2` — P5: vigilancia de puertos configurados (config en `%APPDATA%\GLORYPORT`).
 2. `128A-3` — P6: instalador ligero (MSI/zip) y firma de código.
 3. `128A-4` — Mostrar línea de comando del proceso en el tooltip del menú (PID → cmdline).
+4. `128A-5` — Re-verificar puerto/PID justo antes de matar desde el menú (evitar matar un
+   PID reutilizado entre apertura del menú y clic).
+5. `128A-6` — Recuperación de instancia única si el mutex queda huérfano (reintentar
+   `CreateMutexW`/`FindWindowW` o reclamar cuando no exista ventana).
 
 ## Planes activos
 
