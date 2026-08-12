@@ -1,6 +1,7 @@
 # GLORYPORT — Arquitectura y plan
 
-Fecha: 2026-08-12 · Estado: v1 implementada · Fuente de decisión canónica: este documento.
+Fecha: 2026-08-12 · Estado: v1.1 implementada (popup Wispr Flow) · Fuente de decisión
+canónica: este documento.
 
 ## 1. Contexto y objetivo
 
@@ -52,10 +53,12 @@ Razones del stack elegido:
 ```mermaid
 flowchart TD
     A[main.rs<br/>punto de entrada] --> B[cli.rs<br/>despacho: tray / list / kill]
-    B -->|tray| C[tray.rs<br/>bandeja + menú + eventos]
+    B -->|tray| C[tray.rs<br/>bandeja + eventos + notificaciones]
     B -->|list / kill| D[ports.rs<br/>escáner TCP]
     C --> D
     C --> E[process.rs<br/>kill por PID]
+    C --> M[popup.rs<br/>popup Wispr Flow pintado con GDI]
+    M --> N[fonts.rs<br/>Figtree + EB Garamond embebidas]
     D --> F[process.rs<br/>nombre por PID con caché]
     C --> G[autostart.rs<br/>Run HKCU]
     C --> H[icon.rs<br/>ICO embebido -> HICON]
@@ -70,20 +73,39 @@ sequenceDiagram
     participant U as Usuario
     participant T as tray.rs
     participant P as ports.rs
+    participant M as popup.rs
     participant K as process.rs
     participant N as Shell_NotifyIcon
     U->>T: clic derecho/izquierdo en icono
     T->>P: scan_listeners()
     P-->>T: Vec<PortInfo> ordenado (1 llamada Win32)
-    T->>T: reconstruye menú (puerto + proceso + PID)
-    U->>T: clic en "3000 node.exe (12345)"
-    T->>K: kill_pid(12345)
+    T->>M: show(puertos, autostart)
+    M-->>T: Action elegida
+    T->>K: kill_pid(pid) / toggle autostart / salir
     K-->>T: Ok / Error detallado
     T->>N: notificación de resultado (sin bloquear)
 ```
 
 No existe refresco automático: el menú se reconstruye completo en cada apertura. Esto es lo
 que mantiene el consumo de CPU en ~0% cuando la app está inactiva.
+
+### Gotcha del clic en el icono (NOTIFYICON_VERSION_4)
+
+Con `NIM_SETVERSION` a `NOTIFYICON_VERSION_4`, el shell empaqueta el identificador del icono
+en la **palabra alta** de `lParam` del callback: `lParam = (uID << 16) | mensaje_de_ratón`.
+El handler debe comparar `lParam & 0xFFFF`, no el valor completo; comparar el valor completo
+rompe el clic físico (los mensajes `PostMessage` de prueba sí llegaban limpios y enmascaraban
+el bug). Además, un clic real entrega `WM_LBUTTONDOWN`/`WM_LBUTTONUP` y un `NIN_SELECT`
+(`WM_USER`) que debe ignorarse; el clic derecho entrega `WM_CONTEXTMENU`.
+
+El popup **no usa captura de ratón**: si capturara, el segundo clic en el icono cerraba el
+popup por la captura y el shell reenviaba el `WM_LBUTTONUP` que lo reabría. Sin captura, el
+segundo clic llega al icono y `toggle_or_show_menu` lo cierra; el cierre por clic fuera se
+resuelve con `WM_ACTIVATE` (`WA_INACTIVE`), como un menú nativo.
+
+Si Explorer se reinicia, el shell envía `TaskbarCreated` (mensaje registrado con
+`RegisterWindowMessageW`); el tray vuelve a llamar `Shell_NotifyIconW(NIM_ADD)` con la
+misma ventana/icono para no perder el icono.
 
 ## 5. Modelo de datos
 
@@ -112,7 +134,12 @@ Reglas:
 | RAM | Una sola tabla escaneada; caché de nombres con TTL 10 s y tope de 512 entradas. |
 | Procesos hijos | Cero: todas las operaciones vía API Win32. |
 | Arranque | Mutex de instancia única + registro de clase + `Shell_NotifyIcon`; sin red. |
-| Disco | El binario es autocontenido (icono embebido `include_bytes!`). |
+| Disco | El binario es autocontenido (icono y fuentes embebidas). |
+
+Las fuentes Figtree (400/500/600) y EB Garamond (400) se cargan en memoria con
+`AddFontMemResourceEx` desde TTFs incluidos en `assets/fonts/` (generados con
+`tools/make-fonts.py` desde las variables oficiales), con fallback Segoe UI/Georgia. No se
+escribe nada en disco y `fonts::cleanup()` las libera al salir.
 
 Objetivos medibles (v1, verificados en §10):
 
@@ -129,7 +156,7 @@ Objetivos medibles (v1, verificados en §10):
 - En el bucle de mensajes, cualquier fallo de creación (clase, ventana, icono) se reporta
   con `GetLastError` y termina con código ≠ 0.
 - Cleanup garantizado: al salir se elimina el icono (`NIM_DELETE`), se destruye menú y
-  ventana, y se libera el mutex (RAII).
+  ventana, se liberan las fuentes (`fonts::cleanup()`) y el mutex (RAII).
 
 ## 8. Seguridad
 
@@ -143,12 +170,15 @@ Objetivos medibles (v1, verificados en §10):
 ## 9. Estrategia de pruebas
 
 1. **Unitarias**: formateo de dirección IP (v4/v6), decodificación de puerto (network byte
-   order), dedupe/orden, construcción de etiquetas de menú, parseo de args CLI.
+   order), dedupe/orden, layout del popup (altura, filas visibles, scroll, hit-test),
+   construcción de etiquetas, parseo de args CLI.
 2. **Integración E2E** (en `tests/`): el binario auxiliar `gloryport-test-helper` ocupa un
    puerto real; se verifica que `list` lo muestra y que `kill` lo libera (el proceso termina
    y el puerto queda libre).
 3. **Smoke de bandeja**: arrancar `gloryport tray`, verificar ventana oculta creada,
-   proceso vivo, segunda instancia que sale sola, y cierre limpio.
+   proceso vivo, segunda instancia que sale sola, y cierre limpio. Con un clic físico real
+   (`SendInput` con coordenadas absolutas sobre el icono) el popup abre en < 50 ms, se
+   mantiene estable y el segundo clic lo cierra sin reabrir.
 4. **Gate**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
    build release, ejecutar el binario release para `list`.
 
@@ -161,6 +191,7 @@ Objetivos medibles (v1, verificados en §10):
 | P2 | Bandeja: icono, menú, notificaciones, single-instance, auto-inicio | Hecho |
 | P3 | Calidad: tests, clippy, E2E real, smoke tray, release | Hecho |
 | P4 | Cierre: docs, roadmap, completados, commit final | Hecho |
+| P7 | Popup Wispr Flow (GDI, fuentes embebidas) + fix clic físico del icono | Hecho |
 | P5 (futuro) | Refresco automático configurable, puertos vigilados, PID→línea de comando | Pendiente (roadmap) |
 | P6 (futuro) | Instalador ligero / firma de código, actualización | Pendiente (roadmap) |
 
@@ -168,6 +199,8 @@ Objetivos medibles (v1, verificados en §10):
 
 - `gloryport tray`: icono en bandeja, menú con puertos reales, kill con notificación,
   auto-inicio verificable, single-instance, cierre limpio.
+- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (< 50 ms), se
+  mantiene estable sin interacción y el segundo clic o un clic fuera lo cierra.
 - `gloryport list`: tabla correcta (puerto, dirección, PID, proceso) y `--json`.
 - `gloryport kill <puerto>`: termina el/los proceso(s) y reporta resultado con exit code.
 - Gate verde (fmt, clippy `-D warnings`, tests unit + E2E) y smoke de bandeja aprobado.

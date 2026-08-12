@@ -32,15 +32,19 @@ cargo build --release    # binario final: target/release/gloryport.exe
 ## Gate de calidad
 
 Antes de cerrar un bloque: `fmt --check`, `clippy -D warnings`, `test`, y una verificación
-funcional real (listar un puerto ocupado por el helper y matarlo). Un commit solo con gate
-verde.
+funcional real (listar un puerto ocupado por el helper y matarlo; si el bloque toca la
+bandeja, smoke con clic físico sobre el icono). Un commit solo con gate verde.
 
 ## Estructura
 
 - `src/ports.rs` — escáner `GetExtendedTcpTable` + resolución de nombres de proceso.
 - `src/process.rs` — terminación de procesos (`OpenProcess`/`TerminateProcess`).
-- `src/tray.rs` — bandeja del sistema, menú, notificaciones, single-instance.
+- `src/tray.rs` — bandeja del sistema, eventos (clic/`TaskbarCreated`), notificaciones,
+  single-instance.
+- `src/popup.rs` — popup Wispr Flow pintado con GDI (layout, scroll, hit-test, acción).
+- `src/fonts.rs` — fuentes Figtree + EB Garamond embebidas (`AddFontMemResourceEx`).
 - `src/autostart.rs` — auto-inicio vía clave `Run` de HKCU (sin `reg.exe`).
 - `src/icon.rs` — icono embebido (ICO → `HICON`).
 - `src/cli.rs` — modos `list`, `kill`, `tray`, `--version`.
+- `tools/make-fonts.py` — genera los TTFs embebidos desde las variables oficiales.
 - `docs/arquitectura.md` — decisión de diseño y plan.

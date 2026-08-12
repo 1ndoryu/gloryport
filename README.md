@@ -9,17 +9,22 @@ procesos hijos (`netstat`, `taskkill`, `reg.exe`), sin timers en background.
 
 ![GLORYPORT](assets/gloryport.png)
 
+Popup de bandeja estilo **Wispr Flow** (paleta crema/tinta/lavanda, Figtree + EB Garamond
+embebidas), compacto y pintado con GDI:
+
+![Popup GLORYPORT](assets/popup.png)
+
 ## Características
 
-- Bandeja del sistema con menú de puertos en escucha (puerto, proceso, PID), ordenado y
-  deduplicado (IPv4/IPv6 del mismo proceso = una fila).
+- Bandeja del sistema con popup estilizado de puertos en escucha (puerto, proceso, PID),
+  ordenado y deduplicado (IPv4/IPv6 del mismo proceso = una fila).
 - Kill con confirmación implícita: un clic termina el proceso y muestra notificación con el
   resultado (éxito o error con motivo real, p. ej. acceso denegado).
 - Auto-inicio opcional vía clave `Run` de HKCU (sin `reg.exe`).
 - Instancia única: una segunda copia notifica a la primera y sale sola.
 - CLI para scripting: `list` (tabla o JSON) y `kill <puerto>` con exit codes.
 - Bajo consumo: sin refresco automático, ~0 % CPU en reposo, ~1,5–2,5 MB de RAM privada en
-  bandeja (WorkingSet ~10–17 MB según el sistema), binario release de ~192 KB (0,19 MB).
+  bandeja (WorkingSet ~10–17 MB según el sistema), binario release de ~348 KB (0,34 MB).
 
 ## Requisitos
 
@@ -43,13 +48,17 @@ El binario es autocontenido (el icono va embebido); no requiere instalar nada m�
 gloryport          # o: gloryport tray
 ```
 
-Aparece el icono en la bandeja. Un clic (o el menú) abre la lista de puertos; cada entrada
-es `puerto  proceso (PID)`. El menú incluye:
+Aparece el icono en la bandeja. Un clic abre el popup con la lista de puertos; cada fila
+muestra `puerto  proceso (PID)`. Un segundo clic en el icono (o un clic fuera del popup) lo
+cierra, como un menú nativo. El popup incluye:
 
 - **Actualizar**: re-escanea la tabla TCP.
 - **Auto-inicio**: activa/desactiva el arranque con Windows (HKCU).
 - **Acerca de**: versión y stack.
 - **Salir**: cierre limpio (elimina icono, ventana y mutex).
+
+Si hay más de 60 puertos, el popup se desplaza con la rueda del ratón y muestra el total
+real en la insignia (`60+ TCP`).
 
 > Nota: al invocar la CLI desde PowerShell, el binario usa subsistema gráfico (sin ventana
 > de consola al arrancar como app); si una salida se ve truncada por el host, usa `cmd /c`
@@ -85,17 +94,17 @@ Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso de
 - [roadmap.md](roadmap.md) — cola operativa y fases futuras.
 - [AGENTS.md](AGENTS.md) — contrato del proyecto y gate de calidad.
 
-## Calidad verificada (v1)
+## Calidad verificada (v1.1)
 
 | Chequeo | Resultado |
 |---|---|
-| `cargo test` | 13/13 OK (10 unit + 3 E2E con puerto real) |
+| `cargo test` | 23/23 OK (20 unit + 3 E2E con puerto real) |
 | `cargo clippy --all-targets -- -D warnings` | OK |
 | `cargo fmt --check` | OK |
-| Smoke bandeja | Ventana oculta creada, proceso vivo, segunda instancia sale sola |
+| Smoke bandeja | Icono en bandeja; clic físico abre el popup en ~25 ms, estable, 2.º clic cierra |
 | RAM en bandeja | WorkingSet ~10 MB / privada ~1,5 MB, 4 hilos |
 | `gloryport list` (release) | ~44 ms, 26 filas en máquina de prueba |
-| Binario release | 196.608 bytes (~192 KB) |
+| Binario release | 348.160 bytes (~340 KB), autocontenido (icono + fuentes) |
 
 ## Límites conocidos
 

@@ -22,6 +22,8 @@ dueño desde la bandeja del sistema. Rust nativo, un binario, sin runtime. Fuent
    PID reutilizado entre apertura del menú y clic).
 5. `128A-6` — Recuperación de instancia única si el mutex queda huérfano (reintentar
    `CreateMutexW`/`FindWindowW` o reclamar cuando no exista ventana).
+6. `128A-8` — Mitigación de iconos fantasma en la bandeja tras cierres forzados del
+   proceso (refresh del icono al arrancar y/o limpieza al detectar ventana muerta).
 
 ## Planes activos
 
