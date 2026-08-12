@@ -1,0 +1,45 @@
+[package]
+name = "gloryport"
+version = "0.1.0"
+edition = "2021"
+description = "Gestor minimalista de puertos TCP para Windows, desde la bandeja del sistema"
+license = "MIT"
+
+[[bin]]
+name = "gloryport"
+path = "src/main.rs"
+
+# Binario auxiliar solo para pruebas funcionales: mantiene un puerto ocupado.
+# No forma parte del producto final; no se publica en releases.
+[[bin]]
+name = "gloryport-test-helper"
+path = "src/bin/hold_port.rs"
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Security",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[profile.release]
+# Binario pequeño y rápido: prioridad del proyecto (bajo consumo).
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
