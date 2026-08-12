@@ -25,6 +25,9 @@ const AF_INET6: u32 = 23;
 const NAME_CACHE_MAX: usize = 512;
 /// TTL de la caché: evita abrir el mismo proceso repetidamente entre aperturas del menú.
 const NAME_CACHE_TTL: Duration = Duration::from_secs(10);
+/// Procesos que nunca se ofrecen al kill aunque cumplan el filtro de aplicación:
+/// son sincronizadores/auxiliares del sistema que no deben cerrarse desde la bandeja.
+const PROCESOS_EXCLUIDOS: &[&str] = &["googledrivefs.exe"];
 
 /// Un puerto TCP en escucha y el proceso que lo ocupa.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +39,9 @@ pub struct PortInfo {
     /// Ruta completa del ejecutable (p. ej. `C:\Program Files\nodejs\node.exe`).
     /// `None` cuando el proceso ya no existe o Windows niega el acceso.
     pub process_path: Option<String>,
+    /// Línea de comandos completa del proceso (p. ej. `node ...\server.js`).
+    /// `None` cuando no es legible (sistema/otro usuario) o el proceso murió.
+    pub process_cmd: Option<String>,
 }
 
 impl PortInfo {
@@ -46,6 +52,7 @@ impl PortInfo {
             address: ipv4_to_string(row.dwLocalAddr),
             process_name: String::new(),
             process_path: None,
+            process_cmd: None,
         }
     }
 
@@ -56,6 +63,7 @@ impl PortInfo {
             address: ipv6_to_string(&row.ucLocalAddr),
             process_name: String::new(),
             process_path: None,
+            process_cmd: None,
         }
     }
 }
@@ -85,17 +93,100 @@ pub fn scan_listeners() -> Result<Vec<PortInfo>, ScanError> {
 /// Adjunta el nombre del proceso a cada fila usando una caché con TTL.
 pub fn attach_process_names(rows: &mut [PortInfo], cache: &mut NameCache) {
     for row in rows.iter_mut() {
-        let (name, path) = cache.get(row.pid);
+        let (name, path, cmd) = cache.get(row.pid);
         row.process_name = name;
         row.process_path = path;
+        row.process_cmd = cmd;
     }
+}
+
+/// Extensiones de script que delatan el "programa real" detrás de un intérprete
+/// (node, bun, deno…): la primera ruta con estas extensiones en la línea de
+/// comandos es la aplicación que realmente sirve el puerto.
+const EXTENSIONES_SCRIPT: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts"];
+
+/// Etiqueta legible del proceso para popup/CLI.
+///
+/// Para intérpretes muestra el script que ejecutan (`…\codex-bridge\bridge\server.js`
+/// en vez de `node.exe`); para el resto, el nombre del ejecutable. Deriva del
+/// proceso real de cada escaneo: **nunca** mapea puerto→aplicación, porque una
+/// misma app puede ocupar puertos distintos en días distintos.
+pub fn etiqueta_visible(row: &PortInfo) -> String {
+    if let Some(cmd) = row.process_cmd.as_deref() {
+        if let Some(script) = primer_script(cmd) {
+            return acortar_ruta(&normalizar_ruta(&script));
+        }
+    }
+    row.process_name.clone()
+}
+
+/// Primer argumento de la línea de comandos que parece un script (extensión
+/// conocida), saltando flags y el propio ejecutable.
+fn primer_script(cmd: &str) -> Option<String> {
+    tokenizar_cmdline(cmd).into_iter().skip(1).find(|token| {
+        if token.starts_with('-') {
+            return false;
+        }
+        let ext = token.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        EXTENSIONES_SCRIPT.contains(&ext.as_str())
+    })
+}
+
+/// Tokeniza una línea de comandos de Windows respetando comillas dobles.
+fn tokenizar_cmdline(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for c in cmd.chars() {
+        match c {
+            '"' => in_quote = !in_quote,
+            ' ' | '\t' if !in_quote => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Normaliza la ruta textualmente (colapsa `.` y `..`) sin tocar el disco:
+/// convierte `node_modules\.bin\..\vite\bin\vite.js` en la ruta real del script.
+fn normalizar_ruta(ruta: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for comp in ruta.split(['\\', '/']) {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    let prefix = if ruta.starts_with("\\\\") { "\\\\" } else { "" };
+    format!("{prefix}{}", out.join("\\"))
+}
+
+/// Acorta la ruta a sus últimos 3 componentes para que quepa en la fila del popup
+/// conservando lo identificable (`…\codex-bridge\bridge\server.js`).
+fn acortar_ruta(ruta: &str) -> String {
+    let comps: Vec<&str> = ruta.split(['\\', '/']).filter(|c| !c.is_empty()).collect();
+    if comps.len() <= 3 {
+        return ruta.to_string();
+    }
+    format!("…\\{}", comps[comps.len() - 3..].join("\\"))
 }
 
 /// Filtra la lista dejando solo puertos de **aplicaciones de usuario**.
 ///
-/// Regla: puerto ≥ 1024 (los inferiores son privilegiados/servicios de Windows) y
-/// ejecutable resoluble **fuera** de la carpeta Windows. Esto oculta servicios del
-/// sistema (svchost, System, RPC…) y procesos muertos/sin permiso ("desconocido"),
+/// Regla: puerto ≥ 1024 (los inferiores son privilegiados/servicios de Windows),
+/// ejecutable resoluble **fuera** de la carpeta Windows y proceso no incluido en la
+/// blocklist. Esto oculta servicios del sistema (svchost, System, RPC…), procesos
+/// muertos/sin permiso ("desconocido") y sincronizadores (p. ej. GoogleDriveFS),
 /// que nunca deben cerrarse desde la bandeja.
 pub fn solo_aplicaciones(rows: Vec<PortInfo>) -> Vec<PortInfo> {
     rows.into_iter().filter(es_puerto_de_aplicacion).collect()
@@ -105,9 +196,28 @@ fn es_puerto_de_aplicacion(row: &PortInfo) -> bool {
     if row.port < 1024 {
         return false;
     }
+    if esta_excluido(row) {
+        return false;
+    }
     row.process_path
         .as_deref()
         .is_some_and(|p| !es_ruta_del_sistema(p))
+}
+
+/// ¿El proceso está en la blocklist? Compara nombre derivado y basename del path,
+/// case-insensitive, para cubrir también filas con nombre aún vacío.
+fn esta_excluido(row: &PortInfo) -> bool {
+    let nombre = if row.process_name.is_empty() {
+        row.process_path
+            .as_deref()
+            .and_then(|p| p.rsplit('\\').next())
+            .unwrap_or("")
+    } else {
+        row.process_name.as_str()
+    };
+    PROCESOS_EXCLUIDOS
+        .iter()
+        .any(|excluido| nombre.eq_ignore_ascii_case(excluido))
 }
 
 /// ¿La ruta está dentro de la carpeta Windows del sistema (case-insensitive)?
@@ -128,6 +238,7 @@ pub struct NameCache {
 struct ResolvedProcess {
     name: String,
     path: Option<String>,
+    cmd: Option<String>,
     at: Instant,
 }
 
@@ -144,14 +255,15 @@ impl NameCache {
         }
     }
 
-    pub fn get(&mut self, pid: u32) -> (String, Option<String>) {
+    pub fn get(&mut self, pid: u32) -> (String, Option<String>, Option<String>) {
         if let Some(entry) = self.entries.get(&pid) {
             if entry.at.elapsed() < NAME_CACHE_TTL {
-                return (entry.name.clone(), entry.path.clone());
+                return (entry.name.clone(), entry.path.clone(), entry.cmd.clone());
             }
         }
         // Una sola apertura del proceso resuelve ruta y nombre derivado.
         let path = process::resolve_process_path(pid);
+        let cmd = process::resolve_process_cmdline(pid);
         let name = path
             .as_deref()
             .map(|p| p.rsplit('\\').next().unwrap_or(p).to_string())
@@ -159,11 +271,12 @@ impl NameCache {
         let entry = ResolvedProcess {
             name: name.clone(),
             path: path.clone(),
+            cmd: cmd.clone(),
             at: Instant::now(),
         };
         self.entries.insert(pid, entry);
         self.evict_if_needed();
-        (name, path)
+        (name, path, cmd)
     }
 
     fn evict_if_needed(&mut self) {
@@ -389,6 +502,7 @@ mod tests {
                 address: "0.0.0.0".into(),
                 process_name: String::new(),
                 process_path: None,
+                process_cmd: None,
             },
             PortInfo {
                 port: 80,
@@ -396,6 +510,7 @@ mod tests {
                 address: "0.0.0.0".into(),
                 process_name: String::new(),
                 process_path: None,
+                process_cmd: None,
             },
             PortInfo {
                 port: 3000,
@@ -403,6 +518,7 @@ mod tests {
                 address: "[::]".into(),
                 process_name: String::new(),
                 process_path: None,
+                process_cmd: None,
             },
             PortInfo {
                 port: 3000,
@@ -410,6 +526,7 @@ mod tests {
                 address: "127.0.0.1".into(),
                 process_name: String::new(),
                 process_path: None,
+                process_cmd: None,
             },
         ];
         dedupe_and_sort(&mut rows);
@@ -423,7 +540,7 @@ mod tests {
     #[test]
     fn name_cache_evicts_and_reuses() {
         let mut cache = NameCache::new();
-        let (a, path) = cache.get(u32::MAX); // PID improbable: sin ruta ni nombre
+        let (a, path, _cmd) = cache.get(u32::MAX); // PID improbable: sin ruta ni nombre
         assert_eq!(a, "desconocido");
         assert!(path.is_none());
         assert_eq!(cache.entries.len(), 1);
@@ -438,6 +555,7 @@ mod tests {
                 address: "0.0.0.0".into(),
                 process_name: String::new(),
                 process_path: path.map(str::to_string),
+                process_cmd: None,
             }
         }
 
@@ -451,10 +569,73 @@ mod tests {
             row(8080, None), // proceso muerto/sin permiso: no confirmable
             row(80, Some(r"C:\Program Files\nodejs\node.exe")), // puerto privilegiado
             row(9000, Some(r"c:\windows\system32\dwm.exe")), // case-insensitive
+            row(
+                7679,
+                Some(r"C:\Program Files\Google\Drive File Stream\GoogleDriveFS.exe"),
+            ), // sincronizador excluido por blocklist
         ];
 
         let kept = solo_aplicaciones(rows);
         let kept_ports: Vec<u16> = kept.iter().map(|r| r.port).collect();
         assert_eq!(kept_ports, vec![3000, 5432]);
+
+        // La blocklist también aplica cuando el nombre derivado está relleno.
+        let mut fila_google = row(
+            7679,
+            Some(r"C:\Program Files\Google\Drive File Stream\GoogleDriveFS.exe"),
+        );
+        fila_google.process_name = "GoogleDriveFS.exe".into();
+        assert!(!es_puerto_de_aplicacion(&fila_google));
+    }
+
+    #[test]
+    fn etiqueta_muestra_script_de_node_y_bun() {
+        fn row(name: &str, cmd: Option<&str>) -> PortInfo {
+            PortInfo {
+                port: 3101,
+                pid: 1000,
+                address: "127.0.0.1".into(),
+                process_name: name.into(),
+                process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
+                process_cmd: cmd.map(str::to_string),
+            }
+        }
+
+        let bridge = row(
+            "node.exe",
+            Some(
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\Owner\OneDrive\Documentos\area-trabajo\gloryapi\integrations\codex-bridge\bridge\server.js"#,
+            ),
+        );
+        assert_eq!(
+            etiqueta_visible(&bridge),
+            "…\\codex-bridge\\bridge\\server.js"
+        );
+
+        let bun = row(
+            "bun.exe",
+            Some(
+                r#"C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\resources\bun\bun.exe C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\resources\orchestrator\orchestrator.js"#,
+            ),
+        );
+        assert_eq!(
+            etiqueta_visible(&bun),
+            "…\\resources\\orchestrator\\orchestrator.js"
+        );
+
+        // Ruta con `\.bin\..` se normaliza y el flag se salta.
+        let vite = row(
+            "node.exe",
+            Some(
+                r#""node" "C:\Users\Owner\OneDrive\Documentos\area-trabajo\gloryapi\node_modules\.bin\..\vite\bin\vite.js""#,
+            ),
+        );
+        let label = etiqueta_visible(&vite);
+        assert_eq!(label, "…\\vite\\bin\\vite.js");
+        assert!(!label.contains(".bin"));
+
+        // Sin línea de comandos: cae al nombre del ejecutable.
+        let sin_cmd = row("node.exe", None);
+        assert_eq!(etiqueta_visible(&sin_cmd), "node.exe");
     }
 }

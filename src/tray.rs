@@ -286,20 +286,6 @@ unsafe fn show_menu(hwnd: HWND) {
                 ),
             }
         }
-        Action::About => {
-            notify(
-                hwnd,
-                "Acerca de GLORYPORT",
-                &format!(
-                    "v{} — Puertos TCP en escucha desde la bandeja.\nClic en un puerto termina su proceso.",
-                    env!("CARGO_PKG_VERSION")
-                ),
-                NIIF_INFO,
-            );
-        }
-        Action::Exit => {
-            let _ = PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0));
-        }
     }
 }
 
@@ -310,7 +296,9 @@ fn handle_kill(hwnd: HWND, row: &PortInfo) {
             "Puerto liberado",
             &format!(
                 "El puerto {} quedó libre: se terminó {} (PID {}).",
-                row.port, row.process_name, row.pid
+                row.port,
+                ports::etiqueta_visible(row),
+                row.pid
             ),
             NIIF_INFO,
         ),

@@ -30,10 +30,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
-    GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    ShowWindow, TranslateMessage, MSG, SW_SHOWNOACTIVATE, WA_INACTIVE, WM_ACTIVATE, WM_APP,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetCursorPos, GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetCursor, SetForegroundWindow, ShowWindow, TranslateMessage, HCURSOR, IDC_ARROW, MSG,
+    SW_SHOWNOACTIVATE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::fonts;
@@ -58,8 +59,6 @@ const PAD_TOP: i32 = 12;
 const ROW_H: i32 = 34;
 const FOOTER_GAP: i32 = 10;
 const FOOTER_ITEM_H: i32 = 28;
-const SALIR_GAP: i32 = 10;
-const SALIR_H: i32 = 36;
 const PAD_BOTTOM: i32 = 12;
 const CORNER_RADIUS: i32 = 14;
 const SCROLL_W: i32 = 4;
@@ -75,8 +74,6 @@ pub enum Action {
     Kill(PortInfo),
     Refresh,
     ToggleAutostart,
-    About,
-    Exit,
 }
 
 /// Región interactiva bajo el cursor.
@@ -86,8 +83,6 @@ enum Hit {
     Row(usize),
     Refresh,
     ToggleAutostart,
-    About,
-    Exit,
 }
 
 /// Geometría calculada del popup; también se prueba de forma aislada.
@@ -99,7 +94,6 @@ struct Layout {
     rows_top: i32,
     rows_bottom: i32,
     footer_top: i32,
-    salir_top: i32,
     max_scroll: usize,
     has_scroll: bool,
 }
@@ -111,8 +105,7 @@ impl Layout {
         let rows_top = BORDER + PAD_TOP;
         let rows_bottom = rows_top + rows_visible as i32 * ROW_H;
         let footer_top = rows_bottom + FOOTER_GAP;
-        let salir_top = footer_top + 3 * FOOTER_ITEM_H + SALIR_GAP;
-        let height = salir_top + SALIR_H + PAD_BOTTOM + BORDER;
+        let height = footer_top + 2 * FOOTER_ITEM_H + PAD_BOTTOM + BORDER;
         Self {
             width: WIDTH,
             height,
@@ -120,7 +113,6 @@ impl Layout {
             rows_top,
             rows_bottom,
             footer_top,
-            salir_top,
             max_scroll,
             has_scroll: max_scroll > 0,
         }
@@ -163,19 +155,11 @@ fn hit_test(pt: (i32, i32), layout: &Layout, scroll: usize, rows_total: usize) -
             Hit::None
         };
     }
-    if y >= layout.footer_top && y < layout.footer_top + 3 * FOOTER_ITEM_H {
+    if y >= layout.footer_top && y < layout.footer_top + 2 * FOOTER_ITEM_H {
         return match (y - layout.footer_top) / FOOTER_ITEM_H {
             0 => Hit::Refresh,
-            1 => Hit::ToggleAutostart,
-            _ => Hit::About,
+            _ => Hit::ToggleAutostart,
         };
-    }
-    if y >= layout.salir_top
-        && y < layout.salir_top + SALIR_H
-        && x >= PAD_X
-        && x < layout.width - PAD_X
-    {
-        return Hit::Exit;
     }
     Hit::None
 }
@@ -209,6 +193,10 @@ struct PopupState {
 
 static STATE: Mutex<Option<PopupState>> = Mutex::new(None);
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+/// Cursor de flecha del popup (raw `usize` porque `HCURSOR` no es `Sync`): evita
+/// que el sistema deje el cursor previo del hilo (p. ej. el de espera) cuando la
+/// clase no declara cursor propio.
+static CURSOR_ARROW: OnceLock<usize> = OnceLock::new();
 /// Época (ms) del último cierre del popup: el clic de bandeja que lo cerró puede
 /// llegar después y no debe reabrirlo (carrera clásica de menús de bandeja).
 static LAST_CLOSED_MS: AtomicU64 = AtomicU64::new(0);
@@ -394,12 +382,18 @@ unsafe fn register_class() {
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(std::ptr::null_mut())),
         lpszClassName: w!("GloryPortPopupWnd"),
         ..Default::default()
     };
-    if RegisterClassW(&wc) != 0 {
-        let _ = CLASS_REGISTERED.set(());
+    if RegisterClassW(&wc) == 0 {
+        return; // fallo de registro: se reintenta en la próxima apertura
     }
+    if !wc.hCursor.is_invalid() {
+        // El cursor del sistema no se destruye; se conserva para WM_SETCURSOR.
+        let _ = CURSOR_ARROW.set(wc.hCursor.0 as usize);
+    }
+    let _ = CLASS_REGISTERED.set(());
 }
 
 /// Posición en el cursor, recortada al área de trabajo del monitor bajo el puntero.
@@ -434,6 +428,14 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1), // sin borrado: pintamos todo el fondo
+        WM_SETCURSOR => {
+            // Fija siempre la flecha: la clase no hereda el cursor del hilo (causa
+            // del cursor de espera al pasar por encima del popup).
+            if let Some(cursor) = CURSOR_ARROW.get() {
+                let _ = SetCursor(Some(HCURSOR(*cursor as *mut core::ffi::c_void)));
+            }
+            LRESULT(1)
+        }
         WM_MOUSEMOVE => {
             on_mousemove(hwnd, lparam);
             LRESULT(0)
@@ -517,8 +519,6 @@ fn action_for(hit: Hit) -> Action {
             .unwrap_or(Action::None),
         Hit::Refresh => Action::Refresh,
         Hit::ToggleAutostart => Action::ToggleAutostart,
-        Hit::About => Action::About,
-        Hit::Exit => Action::Exit,
     }
 }
 
@@ -665,7 +665,7 @@ fn draw_all(dc: HDC, w: i32, h: i32, state: &PopupState) {
             draw_scrollbar(dc, ui, &layout, state);
         }
 
-        // Pie: Actualizar lista, Iniciar con Windows (toggle), Acerca de y Salir.
+        // Pie: Actualizar lista e Iniciar con Windows (toggle).
         draw_footer(dc, ui, &layout, state);
     }
 }
@@ -721,13 +721,14 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
             right: pid_rect.left - 6,
             bottom: row_rect.bottom,
         };
-        text(
+        // Elipsis al INICIO: cuando la ruta no cabe, se recorta el comienzo y se
+        // conserva el final (lo identificable), en lugar de cortar la cola.
+        text_leading_ellipsis(
             dc,
             ui.fonts.figtree_400_13,
-            &row.process_name,
+            &crate::ports::etiqueta_visible(row),
             name_rect,
             INK,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
     }
 }
@@ -737,7 +738,6 @@ fn draw_footer(dc: HDC, ui: &Ui, layout: &Layout, state: &PopupState) {
         let items = [
             ("Actualizar lista", Hit::Refresh),
             ("Iniciar con Windows", Hit::ToggleAutostart),
-            ("Acerca de", Hit::About),
         ];
         for (i, (label, hit)) in items.iter().enumerate() {
             let item_rect = RECT {
@@ -767,25 +767,6 @@ fn draw_footer(dc: HDC, ui: &Ui, layout: &Layout, state: &PopupState) {
                 draw_toggle(dc, ui, &item_rect, state.autostart_on);
             }
         }
-
-        // Botón primario "Salir": lavanda, borde tinta 2 px, radio 12.
-        let salir = RECT {
-            left: PAD_X,
-            top: layout.salir_top,
-            right: layout.width - PAD_X,
-            bottom: layout.salir_top + SALIR_H,
-        };
-        let _ = SelectObject(dc, ui.brush_lavender.into());
-        let _ = SelectObject(dc, ui.pen_ink2.into());
-        let _ = RoundRect(dc, salir.left, salir.top, salir.right, salir.bottom, 24, 24);
-        text(
-            dc,
-            ui.fonts.figtree_500_13,
-            "Salir",
-            salir,
-            INK,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
     }
 }
 
@@ -873,6 +854,51 @@ unsafe fn text(dc: HDC, font: HFONT, s: &str, rc: RECT, color: COLORREF, flags: 
     let _ = SelectObject(dc, old);
 }
 
+/// Texto que, si no cabe en `rc`, se recorta por el PRINCIPIO anteponiendo `…`
+/// (conserva el final de la ruta). `DT_BEGINNING_ELLIPSIS` no existe en Win32,
+/// por eso se mide con `GetTextExtentPoint32W` y se busca la cola más larga que quepa.
+unsafe fn text_leading_ellipsis(dc: HDC, font: HFONT, s: &str, rc: RECT, color: COLORREF) {
+    let avail = rc.right - rc.left;
+    let out = sufijo_con_elipsis(s, |c| {
+        let (cw, _) = measure(dc, font, c);
+        cw <= avail
+    });
+    text(
+        dc,
+        font,
+        &out,
+        rc,
+        color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+}
+
+/// Calcula la cadena a dibujar cuando el ancho es limitado: si el texto completo no
+/// cabe, recorta por el PRINCIPIO (búsqueda binaria sobre índices de carácter) y
+/// antepone `…`, conservando el final de la ruta. `cabe` mide una candidata.
+fn sufijo_con_elipsis(s: &str, cabe: impl Fn(&str) -> bool) -> String {
+    if cabe(s) {
+        return s.to_string();
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let cand = format!("…{}", &s[chars[mid].0..]);
+        if cabe(&cand) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if lo < chars.len() {
+        format!("…{}", &s[chars[lo].0..])
+    } else {
+        "…".to_string()
+    }
+}
+
 unsafe fn measure(dc: HDC, font: HFONT, s: &str) -> (i32, i32) {
     let buf: Vec<u16> = s.encode_utf16().collect();
     let old = SelectObject(dc, font.into());
@@ -891,6 +917,23 @@ mod tests {
     }
 
     #[test]
+    fn sufijo_con_elipsis_conserva_el_final() {
+        let ruta = "…\\codex-bridge\\bridge\\server.js";
+
+        // Cabe completo: sin recorte.
+        assert_eq!(sufijo_con_elipsis(ruta, |s| s.len() <= 40), ruta);
+
+        // No cabe: se recorta el PRINCIPIO y se conserva el final de la ruta.
+        assert_eq!(
+            sufijo_con_elipsis(ruta, |s| s.len() <= 20),
+            "…\\bridge\\server.js"
+        );
+
+        // Caso límite: ni el último carácter con `…` cabe → solo la elipsis.
+        assert_eq!(sufijo_con_elipsis("abc", |s| s.len() <= 1), "…");
+    }
+
+    #[test]
     fn layout_grows_with_rows_and_caps_visible() {
         let empty = Layout::new(0);
         assert_eq!(empty.rows_visible, 1);
@@ -900,7 +943,7 @@ mod tests {
         assert_eq!(five.rows_visible, 5);
         assert_eq!(five.max_scroll, 0);
         assert!(!five.has_scroll);
-        assert_eq!(five.height, 5 * ROW_H + 168);
+        assert_eq!(five.height, 5 * ROW_H + 94);
 
         let nine = Layout::new(9);
         assert_eq!(nine.rows_visible, MAX_VISIBLE_ROWS);
@@ -909,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_rows_footer_and_exit() {
+    fn hit_test_rows_and_footer() {
         let layout = Layout::new(8);
         assert_eq!(
             hit_test(row(layout.rows_top + 5), &layout, 0, 8),
@@ -926,19 +969,6 @@ mod tests {
         assert_eq!(
             hit_test(row(layout.footer_top + FOOTER_ITEM_H + 5), &layout, 0, 8),
             Hit::ToggleAutostart
-        );
-        assert_eq!(
-            hit_test(
-                row(layout.footer_top + 2 * FOOTER_ITEM_H + 5),
-                &layout,
-                0,
-                8
-            ),
-            Hit::About
-        );
-        assert_eq!(
-            hit_test((PAD_X + 10, layout.salir_top + 10), &layout, 0, 8),
-            Hit::Exit
         );
         assert_eq!(hit_test((2, 2), &layout, 0, 8), Hit::None);
     }
@@ -995,6 +1025,7 @@ mod tests {
             address: "0.0.0.0".into(),
             process_name: "node.exe".into(),
             process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
+            process_cmd: None,
         }
     }
 }

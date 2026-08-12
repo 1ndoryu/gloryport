@@ -90,7 +90,7 @@ fn cmd_list(args: &[String]) -> ExitCode {
                 row.port,
                 row.address,
                 row.pid,
-                row.process_name
+                ports::etiqueta_visible(row)
             );
         }
     }
