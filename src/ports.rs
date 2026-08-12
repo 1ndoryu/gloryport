@@ -290,11 +290,6 @@ fn dedupe_and_sort(rows: &mut Vec<PortInfo>) {
     rows.dedup_by(|a, b| a.port == b.port && a.pid == b.pid);
 }
 
-/// Etiqueta de una fila para el menú de bandeja: `puerto  proceso (PID)`.
-pub fn menu_label(row: &PortInfo) -> String {
-    format!("{}  {} ({})", row.port, row.process_name, row.pid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

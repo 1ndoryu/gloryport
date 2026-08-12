@@ -1,12 +1,14 @@
-//! Bandeja del sistema: icono, menú de puertos, notificaciones y ciclo de vida.
+//! Bandeja del sistema: icono, popup de puertos, notificaciones y ciclo de vida.
 //!
-//! El bucle es de un solo hilo y sin timers: el menú se reconstruye completo en cada
-//! apertura (escaneo bajo demanda). Esto mantiene CPU ~0% cuando la app está inactiva.
+//! La UI es el popup pintado con GDI (ver `popup.rs`), estilo "Wispr Flow". El bucle es
+//! de un solo hilo y sin timers: el escaneo ocurre solo al abrir el popup, así la CPU
+//! se mantiene ~0% cuando la app está inactiva.
 
-use windows::core::{w, HSTRING, PCWSTR};
+use std::sync::OnceLock;
+
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -16,29 +18,25 @@ use windows::Win32::UI::Shell::{
     NOTIFY_ICON_INFOTIP_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HMENU,
-    MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
-    WM_LBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    TranslateMessage, HICON, MSG, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
+use crate::popup::Action;
 use crate::ports::PortInfo;
-use crate::{autostart, icon, ports, process};
+use crate::{autostart, fonts, icon, popup, ports, process};
 
 const TRAY_ID: u32 = 1;
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 2;
 
-const ID_REFRESH: usize = 100;
-const ID_AUTOSTART: usize = 101;
-const ID_ABOUT: usize = 102;
-const ID_EXIT: usize = 103;
-const ID_PORT_BASE: usize = 200;
-
-/// Límite de filas en el menú para que siga siendo usable con muchos puertos.
-const MAX_MENU_PORTS: usize = 60;
+/// Ventana e icono vigentes para re-agregar el icono si el shell lo recrea.
+static TRAY_HWND: OnceLock<usize> = OnceLock::new();
+static TRAY_ICON: OnceLock<usize> = OnceLock::new();
+/// Mensaje registrado que el shell envía al recrear la bandeja (p. ej. Explorer).
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 /// Arranca la app de bandeja. Devuelve `Err(mensaje)` si algo impide operar.
 pub fn run() -> Result<(), String> {
@@ -88,19 +86,12 @@ pub fn run() -> Result<(), String> {
             None,
         )
         .map_err(|e| format!("CreateWindowExW falló: {e}"))?;
+        let _ = TRAY_HWND.set(hwnd.0 as usize);
 
         let icon = icon::load_icon().map_err(|e| e.to_string())?;
+        let _ = TRAY_ICON.set(icon.0 as usize);
 
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_ID,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-            uCallbackMessage: WM_APP_TRAY,
-            hIcon: icon,
-            ..Default::default()
-        };
-        copy_wide_into("GLORYPORT — puertos TCP en escucha", &mut nid.szTip);
+        let nid = build_nid(hwnd, icon);
         if Shell_NotifyIconW(NIM_ADD, &nid).0 == 0 {
             return Err(format!(
                 "Shell_NotifyIconW(NIM_ADD) falló (Win32 {})",
@@ -108,15 +99,10 @@ pub fn run() -> Result<(), String> {
             ));
         }
 
-        // Versión 4: clic derecho llega como WM_CONTEXTMENU (comportamiento moderno).
-        let mut version = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_ID,
-            ..Default::default()
-        };
-        version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &version);
+        set_version_4(hwnd);
+
+        // TaskbarCreated: Explorer recrea la bandeja tras reiniciar o colgarse.
+        let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
         // Bucle de mensajes: termina con WM_QUIT (Salir o cierre del sistema).
         let mut msg = MSG::default();
@@ -134,6 +120,7 @@ pub fn run() -> Result<(), String> {
         let _ = DestroyIcon(icon);
         let _ = DestroyWindow(hwnd);
         let _ = unregister_class();
+        fonts::cleanup();
     }
     Ok(())
 }
@@ -170,10 +157,17 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_APP_TRAY => {
-            match lparam.0 as u32 {
-                WM_LBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+            // Con NOTIFYICON_VERSION_4 el shell empaqueta el id del icono en la
+            // palabra alta de lParam: solo la palabra baja es el mensaje de ratón.
+            let mouse_msg = lparam.0 as u32 & 0xFFFF;
+            match mouse_msg {
+                WM_LBUTTONUP | WM_CONTEXTMENU => toggle_or_show_menu(hwnd),
                 _ => {}
             }
+            LRESULT(0)
+        }
+        _ if TASKBAR_CREATED.get().copied() == Some(msg) => {
+            re_add_icon();
             LRESULT(0)
         }
         WM_APP_SHOW_MENU => {
@@ -188,23 +182,65 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// Reconstruye y muestra el menú con los puertos actuales, y procesa la selección.
-unsafe fn show_menu(hwnd: HWND) {
-    let Ok(hmenu) = CreatePopupMenu() else {
+/// Alterna el popup: si ya está abierto lo cierra sin acción; si no, lo abre.
+unsafe fn toggle_or_show_menu(hwnd: HWND) {
+    if popup::is_open() {
+        popup::cancel_active();
+    } else {
+        show_menu(hwnd);
+    }
+}
+
+/// Re-agrega el icono cuando Explorer recrea la bandeja (TaskbarCreated).
+unsafe fn re_add_icon() {
+    let (Some(hwnd_raw), Some(icon_raw)) = (TRAY_HWND.get().copied(), TRAY_ICON.get().copied())
+    else {
         return;
     };
-    let _ = SetForegroundWindow(hwnd);
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    let icon = HICON(icon_raw as *mut core::ffi::c_void);
+    let nid = build_nid(hwnd, icon);
+    let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    set_version_4(hwnd);
+}
 
+unsafe fn build_nid(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_APP_TRAY,
+        hIcon: icon,
+        ..Default::default()
+    };
+    copy_wide_into("GLORYPORT — puertos TCP en escucha", &mut nid.szTip);
+    nid
+}
+
+/// Versión 4: clic derecho llega como WM_CONTEXTMENU (comportamiento moderno).
+unsafe fn set_version_4(hwnd: HWND) {
+    let mut version = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ID,
+        ..Default::default()
+    };
+    version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    let _ = Shell_NotifyIconW(NIM_SETVERSION, &version);
+}
+
+/// Escanea los puertos y muestra el popup estilizado; ejecuta la acción elegida.
+unsafe fn show_menu(hwnd: HWND) {
     let mut ports = match ports::scan_listeners() {
         Ok(p) => p,
         Err(e) => {
-            let _ = AppendMenuW(
-                hmenu,
-                MF_STRING | MF_DISABLED | MF_GRAYED,
-                0,
-                PCWSTR(HSTRING::from(format!("GLORYPORT — error: {e}")).as_ptr()),
+            notify(
+                hwnd,
+                "GLORYPORT",
+                &format!("No se pudo escanear los puertos: {e}"),
+                NIIF_ERROR,
             );
-            let _ = show_and_run(hmenu, hwnd, Vec::new());
             return;
         }
     };
@@ -216,100 +252,12 @@ unsafe fn show_menu(hwnd: HWND) {
         }
     }
 
-    let header = format!("GLORYPORT — {} puertos TCP", ports.len());
-    let _ = AppendMenuW(
-        hmenu,
-        MF_STRING | MF_DISABLED | MF_GRAYED,
-        0,
-        PCWSTR(HSTRING::from(header).as_ptr()),
-    );
-    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
-
-    let shown = ports.len().min(MAX_MENU_PORTS);
-    for (i, row) in ports.iter().take(shown).enumerate() {
-        let label = ports::menu_label(row);
-        let _ = AppendMenuW(
-            hmenu,
-            MF_STRING,
-            ID_PORT_BASE + i,
-            PCWSTR(HSTRING::from(label).as_ptr()),
-        );
-    }
-    if ports.len() > shown {
-        let note = format!("… y {} puertos más", ports.len() - shown);
-        let _ = AppendMenuW(
-            hmenu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            0,
-            PCWSTR(HSTRING::from(note).as_ptr()),
-        );
-    }
-
-    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(
-        hmenu,
-        MF_STRING,
-        ID_REFRESH,
-        PCWSTR(w!("Actualizar lista").as_ptr()),
-    );
-    let autostart_flag = if autostart::is_enabled() {
-        MF_CHECKED
-    } else {
-        MF_UNCHECKED
-    };
-    let _ = AppendMenuW(
-        hmenu,
-        MF_STRING | autostart_flag,
-        ID_AUTOSTART,
-        PCWSTR(w!("Iniciar con Windows").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        hmenu,
-        MF_STRING,
-        ID_ABOUT,
-        PCWSTR(w!("Acerca de GLORYPORT").as_ptr()),
-    );
-    let _ = AppendMenuW(hmenu, MF_STRING, ID_EXIT, PCWSTR(w!("Salir").as_ptr()));
-
-    let _ = show_and_run(hmenu, hwnd, ports);
-}
-
-/// Muestra el menú de forma modal, destruye el handle y ejecuta la acción elegida.
-unsafe fn show_and_run(hmenu: HMENU, hwnd: HWND, ports: Vec<PortInfo>) -> Result<(), String> {
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let cmd = TrackPopupMenu(
-        hmenu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
-        pt.x,
-        pt.y,
-        Some(0),
-        hwnd,
-        None,
-    )
-    .0;
-    let _ = DestroyMenu(hmenu);
-    if cmd <= 0 {
-        return Ok(());
-    }
-    let cmd = cmd as usize;
-
-    if cmd >= ID_PORT_BASE {
-        let idx = cmd - ID_PORT_BASE;
-        if let Some(row) = ports.get(idx) {
-            handle_kill(hwnd, row);
-        }
-        return Ok(());
-    }
-
-    match cmd {
-        // Re-escanea y reabre el menú al instante; el menú ya se reconstruye en
-        // cada apertura, pero este item permite refrescar sin cerrar y volver a abrir.
-        ID_REFRESH => {
-            show_menu(hwnd);
-            Ok(())
-        }
-        ID_AUTOSTART => {
+    match popup::show(hwnd, ports, autostart::is_enabled()) {
+        Action::None => {}
+        Action::Kill(row) => handle_kill(hwnd, &row),
+        // Re-escanea y reabre el popup al instante.
+        Action::Refresh => show_menu(hwnd),
+        Action::ToggleAutostart => {
             let on = !autostart::is_enabled();
             match autostart::set_enabled(on) {
                 Ok(()) => notify(
@@ -329,9 +277,8 @@ unsafe fn show_and_run(hmenu: HMENU, hwnd: HWND, ports: Vec<PortInfo>) -> Result
                     NIIF_ERROR,
                 ),
             }
-            Ok(())
         }
-        ID_ABOUT => {
+        Action::About => {
             notify(
                 hwnd,
                 "Acerca de GLORYPORT",
@@ -341,13 +288,10 @@ unsafe fn show_and_run(hmenu: HMENU, hwnd: HWND, ports: Vec<PortInfo>) -> Result
                 ),
                 NIIF_INFO,
             );
-            Ok(())
         }
-        ID_EXIT => {
+        Action::Exit => {
             let _ = PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0));
-            Ok(())
         }
-        _ => Ok(()),
     }
 }
 

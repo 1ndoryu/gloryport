@@ -1,0 +1,1038 @@
+//! Popup de bandeja estilo "Wispr Flow": ventana Win32 minimalista pintada con GDI.
+//!
+//! Reemplaza el menú nativo (`TrackPopupMenu`) con la paleta crema/tinta/lavanda y las
+//! fuentes Figtree + EB Garamond del estilo de referencia. La ventana es de un solo
+//! uso: se abre, se cierra con una acción (o Esc / clic fuera) y se destruye.
+//! El bucle modal no usa `PostQuitMessage`, de modo que el bucle de la bandeja sigue
+//! vivo al cerrar el popup.
+
+use std::mem::size_of;
+use std::sync::{LazyLock, Mutex, OnceLock};
+
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateRoundRectRgn,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HPEN, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PS_SOLID, SRCCOPY, TRANSPARENT,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
+    GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    ShowWindow, TranslateMessage, MSG, SW_SHOWNOACTIVATE, WA_INACTIVE, WM_ACTIVATE, WM_APP,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+use crate::fonts;
+use crate::ports::PortInfo;
+
+/// Mensaje privado que cierra el bucle modal del popup (sin matar el loop de la bandeja).
+const WM_APP_POPUP_DONE: u32 = WM_APP + 3;
+
+// ── Tokens de estilo "Wispr Flow" (COLORREF = 0x00BBGGRR) ─────────────────────
+const CREAM: COLORREF = COLORREF(0x00EB_FFFF); // Lumen Cream: fondo
+const INK: COLORREF = COLORREF(0x001A_1A1A); // Vast Ink: texto y bordes
+const LAVENDER: COLORREF = COLORREF(0x00FF_D7F0); // Lavender Whisper: primario
+const FOREST: COLORREF = COLORREF(0x0046_4F03); // Forest Ink: badges/acento
+const STONE: COLORREF = COLORREF(0x00D0_E4E4); // Lumen Stone: divisores
+const FOG: COLORREF = COLORREF(0x0080_8A8A); // Fog: texto secundario
+
+// ── Layout compacto (píxeles, base 8) ─────────────────────────────────────────
+const WIDTH: i32 = 300;
+const BORDER: i32 = 2;
+const PAD_X: i32 = 12;
+const PAD_TOP: i32 = 10;
+const HEADER_H: i32 = 40;
+const ROW_H: i32 = 30;
+const FOOTER_GAP: i32 = 8;
+const FOOTER_ITEM_H: i32 = 26;
+const SALIR_GAP: i32 = 8;
+const SALIR_H: i32 = 32;
+const PAD_BOTTOM: i32 = 10;
+const CORNER_RADIUS: i32 = 14;
+const SCROLL_W: i32 = 4;
+const MAX_VISIBLE_ROWS: usize = 8;
+/// Tope de filas de puertos (mismo límite que el menú nativo de v1).
+const MAX_TOTAL_ROWS: usize = 60;
+const WHEEL_STEP: usize = 3;
+
+/// Acción elegida por el usuario en el popup.
+#[derive(Debug)]
+pub enum Action {
+    None,
+    Kill(PortInfo),
+    Refresh,
+    ToggleAutostart,
+    About,
+    Exit,
+}
+
+/// Región interactiva bajo el cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    None,
+    Row(usize),
+    Refresh,
+    ToggleAutostart,
+    About,
+    Exit,
+}
+
+/// Geometría calculada del popup; también se prueba de forma aislada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    width: i32,
+    height: i32,
+    rows_visible: usize,
+    rows_top: i32,
+    rows_bottom: i32,
+    footer_top: i32,
+    salir_top: i32,
+    max_scroll: usize,
+    has_scroll: bool,
+}
+
+impl Layout {
+    fn new(rows_total: usize) -> Self {
+        let rows_visible = rows_total.clamp(1, MAX_VISIBLE_ROWS);
+        let max_scroll = rows_total.saturating_sub(rows_visible);
+        let rows_top = BORDER + PAD_TOP + HEADER_H;
+        let rows_bottom = rows_top + rows_visible as i32 * ROW_H;
+        let footer_top = rows_bottom + FOOTER_GAP;
+        let salir_top = footer_top + 3 * FOOTER_ITEM_H + SALIR_GAP;
+        let height = salir_top + SALIR_H + PAD_BOTTOM + BORDER;
+        Self {
+            width: WIDTH,
+            height,
+            rows_visible,
+            rows_top,
+            rows_bottom,
+            footer_top,
+            salir_top,
+            max_scroll,
+            has_scroll: max_scroll > 0,
+        }
+    }
+
+    fn content_right(&self) -> i32 {
+        if self.has_scroll {
+            self.width - PAD_X - SCROLL_W - 4
+        } else {
+            self.width - PAD_X
+        }
+    }
+
+    fn row_rect(&self, visible_idx: usize) -> RECT {
+        let top = self.rows_top + visible_idx as i32 * ROW_H;
+        RECT {
+            left: 0,
+            top,
+            right: self.width,
+            bottom: top + ROW_H,
+        }
+    }
+}
+
+/// Hit-test por coordenadas de cliente; fila devuelta ya incluye el desplazamiento.
+fn hit_test(pt: (i32, i32), layout: &Layout, scroll: usize, rows_total: usize) -> Hit {
+    let (x, y) = pt;
+    if x < BORDER || x >= layout.width - BORDER {
+        return Hit::None;
+    }
+    if y >= layout.rows_top && y < layout.rows_bottom {
+        if x >= layout.content_right() {
+            return Hit::None;
+        }
+        let local = ((y - layout.rows_top) / ROW_H) as usize;
+        let idx = scroll + local;
+        return if idx < rows_total {
+            Hit::Row(idx)
+        } else {
+            Hit::None
+        };
+    }
+    if y >= layout.footer_top && y < layout.footer_top + 3 * FOOTER_ITEM_H {
+        return match (y - layout.footer_top) / FOOTER_ITEM_H {
+            0 => Hit::Refresh,
+            1 => Hit::ToggleAutostart,
+            _ => Hit::About,
+        };
+    }
+    if y >= layout.salir_top
+        && y < layout.salir_top + SALIR_H
+        && x >= PAD_X
+        && x < layout.width - PAD_X
+    {
+        return Hit::Exit;
+    }
+    Hit::None
+}
+
+/// Ajusta la posición para que el popup quede dentro del área de trabajo.
+fn clamp_pos(x: i32, y: i32, w: i32, h: i32, work: RECT) -> (i32, i32) {
+    let x = x.clamp(work.left, (work.right - w).max(work.left));
+    let y = y.clamp(work.top, (work.bottom - h).max(work.top));
+    (x, y)
+}
+
+/// Desplazamiento de scroll por rueda: 3 filas por muesca, acotado.
+fn scroll_step(current: usize, wheel_delta: i32, max: usize) -> usize {
+    if wheel_delta > 0 {
+        current.saturating_sub(WHEEL_STEP)
+    } else {
+        current.saturating_add(WHEEL_STEP).min(max)
+    }
+}
+
+/// Texto del badge del conteo: `N TCP`, o `N+ TCP` si se truncó la lista.
+fn badge_text(count: usize, extra: usize) -> String {
+    if extra > 0 {
+        format!("{count}+ TCP")
+    } else {
+        format!("{count} TCP")
+    }
+}
+
+// ── Estado y recursos GDI (un solo popup a la vez, mismo hilo) ───────────────
+struct PopupState {
+    ports: Vec<PortInfo>,
+    extra_count: usize,
+    autostart_on: bool,
+    action: Option<Action>,
+    hover: Option<Hit>,
+    scroll: usize,
+    done: bool,
+    tracking: bool,
+}
+
+static STATE: Mutex<Option<PopupState>> = Mutex::new(None);
+static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+struct Ui {
+    brush_cream: HBRUSH,
+    brush_lavender: HBRUSH,
+    brush_forest: HBRUSH,
+    brush_stone: HBRUSH,
+    brush_ink: HBRUSH,
+    pen_ink2: HPEN,
+    pen_stone2: HPEN,
+    pen_lavender2: HPEN,
+    fonts: &'static fonts::Fonts,
+}
+
+// Los objetos GDI viven durante todo el proceso y solo se tocan desde el hilo de
+// la UI; el marcado manual permite exponerlos vía `LazyLock` estático.
+unsafe impl Send for Ui {}
+unsafe impl Sync for Ui {}
+
+static UI: LazyLock<Ui> = LazyLock::new(|| unsafe {
+    Ui {
+        brush_cream: CreateSolidBrush(CREAM),
+        brush_lavender: CreateSolidBrush(LAVENDER),
+        brush_forest: CreateSolidBrush(FOREST),
+        brush_stone: CreateSolidBrush(STONE),
+        brush_ink: CreateSolidBrush(INK),
+        pen_ink2: CreatePen(PS_SOLID, 2, INK),
+        pen_stone2: CreatePen(PS_SOLID, 2, STONE),
+        pen_lavender2: CreatePen(PS_SOLID, 2, LAVENDER),
+        fonts: fonts::get(),
+    }
+});
+
+/// Muestra el popup modal en el cursor y devuelve la acción elegida (bloqueante).
+pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
+    if STATE.lock().unwrap().is_some() {
+        // Popup ya abierto: reentrada del mismo hilo (clic en bandeja), se ignora.
+        return Action::None;
+    }
+    unsafe {
+        register_class();
+        let (ports, extra_count) = truncate_ports(ports);
+        let layout = Layout::new(ports.len());
+        let (x, y) = popup_position(layout.width, layout.height);
+        let Some(hinstance) = hinstance() else {
+            return Action::None;
+        };
+
+        let hwnd = match CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            w!("GloryPortPopupWnd"),
+            PCWSTR::null(),
+            WS_POPUP,
+            x,
+            y,
+            layout.width,
+            layout.height,
+            Some(owner),
+            None,
+            Some(hinstance),
+            None,
+        ) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return Action::None,
+        };
+
+        let rgn = CreateRoundRectRgn(
+            0,
+            0,
+            layout.width + 1,
+            layout.height + 1,
+            CORNER_RADIUS * 2,
+            CORNER_RADIUS * 2,
+        );
+        if !rgn.is_invalid() {
+            let _ = SetWindowRgn(hwnd, Some(rgn), true);
+        }
+
+        *STATE.lock().unwrap() = Some(PopupState {
+            ports,
+            extra_count,
+            autostart_on,
+            action: None,
+            hover: None,
+            scroll: 0,
+            done: false,
+            tracking: false,
+        });
+
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+
+        // Bucle modal propio: no usa PostQuitMessage; termina con WM_APP_POPUP_DONE.
+        let mut msg = MSG::default();
+        let mut quit_code: Option<i32> = None;
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            if r.0 <= 0 {
+                quit_code = Some(msg.wParam.0 as i32);
+                break;
+            }
+            if msg.message == WM_APP_POPUP_DONE {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+
+        let _ = DestroyWindow(hwnd);
+        // Si llegó un WM_QUIT externo, se re-encola para que el bucle de la bandeja salga.
+        if let Some(code) = quit_code {
+            PostQuitMessage(code);
+        }
+    }
+    let action = STATE
+        .lock()
+        .unwrap()
+        .take()
+        .and_then(|s| s.action)
+        .unwrap_or(Action::None);
+    action
+}
+
+/// ¿Hay un popup abierto en este momento?
+pub fn is_open() -> bool {
+    STATE.lock().unwrap().is_some()
+}
+
+/// Cierra el popup activo sin acción (p. ej. segundo clic en el icono de bandeja).
+pub fn cancel_active() {
+    if !is_open() {
+        return;
+    }
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(w!("GloryPortPopupWnd"), PCWSTR::null()) {
+            if !hwnd.is_invalid() {
+                finish(hwnd, Action::None);
+            }
+        }
+    }
+}
+
+unsafe fn hinstance() -> Option<HINSTANCE> {
+    GetModuleHandleW(None).map(|h| h.into()).ok()
+}
+
+unsafe fn register_class() {
+    if CLASS_REGISTERED.get().is_some() {
+        return;
+    }
+    let Some(hinstance) = hinstance() else {
+        return;
+    };
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(wnd_proc),
+        hInstance: hinstance,
+        lpszClassName: w!("GloryPortPopupWnd"),
+        ..Default::default()
+    };
+    if RegisterClassW(&wc) != 0 {
+        let _ = CLASS_REGISTERED.set(());
+    }
+}
+
+/// Posición en el cursor, recortada al área de trabajo del monitor bajo el puntero.
+fn popup_position(w: i32, h: i32) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut info = std::mem::zeroed::<MONITORINFO>();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            clamp_pos(pt.x, pt.y, w, h, info.rcWork)
+        } else {
+            (pt.x, pt.y)
+        }
+    }
+}
+
+fn truncate_ports(ports: Vec<PortInfo>) -> (Vec<PortInfo>, usize) {
+    let total = ports.len();
+    if total > MAX_TOTAL_ROWS {
+        (
+            ports.into_iter().take(MAX_TOTAL_ROWS).collect(),
+            total - MAX_TOTAL_ROWS,
+        )
+    } else {
+        (ports, 0)
+    }
+}
+
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint(hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1), // sin borrado: pintamos todo el fondo
+        WM_MOUSEMOVE => {
+            on_mousemove(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            set_hover(hwnd, None);
+            untrack();
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            on_wheel(wparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            on_lbuttonup(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            on_key(hwnd, wparam);
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            if wparam.0 as u32 & 0xFFFF == WA_INACTIVE {
+                finish(hwnd, Action::None);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn on_mousemove(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = lparam_xy(lparam);
+    arm_track_leave(hwnd);
+    let hit = current_hit(x, y);
+    set_hover(hwnd, Some(hit));
+}
+
+fn on_wheel(wparam: WPARAM) {
+    let delta = ((wparam.0 >> 16) as u16) as i16 as i32;
+    let mut guard = STATE.lock().unwrap();
+    if let Some(s) = guard.as_mut() {
+        let layout = Layout::new(s.ports.len());
+        let next = scroll_step(s.scroll, delta, layout.max_scroll);
+        if next != s.scroll {
+            s.scroll = next;
+            s.hover = None;
+            if let Ok(hwnd) = popup_hwnd() {
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+        }
+    }
+}
+
+fn on_lbuttonup(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = lparam_xy(lparam);
+    let hit = current_hit(x, y);
+    let action = action_for(hit);
+    finish(hwnd, action);
+}
+
+fn on_key(hwnd: HWND, wparam: WPARAM) {
+    let vk = (wparam.0 as u32) as u16;
+    if vk == VK_ESCAPE.0 {
+        finish(hwnd, Action::None);
+    } else if vk == VK_RETURN.0 {
+        let hit = STATE.lock().unwrap().as_ref().and_then(|s| s.hover);
+        finish(hwnd, action_for(hit.unwrap_or(Hit::None)));
+    }
+}
+
+fn action_for(hit: Hit) -> Action {
+    match hit {
+        Hit::None => Action::None,
+        Hit::Row(idx) => STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.ports.get(idx).cloned())
+            .map(Action::Kill)
+            .unwrap_or(Action::None),
+        Hit::Refresh => Action::Refresh,
+        Hit::ToggleAutostart => Action::ToggleAutostart,
+        Hit::About => Action::About,
+        Hit::Exit => Action::Exit,
+    }
+}
+
+/// Registra la acción, marca `done` (evita doble cierre) y despierta el bucle modal.
+fn finish(hwnd: HWND, action: Action) {
+    {
+        let mut guard = STATE.lock().unwrap();
+        if let Some(s) = guard.as_mut() {
+            if s.done {
+                return;
+            }
+            s.done = true;
+            s.action = Some(action);
+        }
+    }
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_APP_POPUP_DONE, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn arm_track_leave(hwnd: HWND) {
+    let mut guard = STATE.lock().unwrap();
+    if let Some(s) = guard.as_mut() {
+        if s.tracking {
+            return;
+        }
+        s.tracking = true;
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = unsafe { TrackMouseEvent(&mut tme) };
+    }
+}
+
+fn untrack() {
+    let mut guard = STATE.lock().unwrap();
+    if let Some(s) = guard.as_mut() {
+        s.tracking = false;
+    }
+}
+
+fn set_hover(hwnd: HWND, hit: Option<Hit>) {
+    let mut guard = STATE.lock().unwrap();
+    if let Some(s) = guard.as_mut() {
+        if s.hover != hit {
+            s.hover = hit;
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+    }
+}
+
+fn current_hit(x: i32, y: i32) -> Hit {
+    let guard = STATE.lock().unwrap();
+    guard.as_ref().map_or(Hit::None, |s| {
+        let layout = Layout::new(s.ports.len());
+        hit_test((x, y), &layout, s.scroll, s.ports.len())
+    })
+}
+
+fn popup_hwnd() -> windows::core::Result<HWND> {
+    unsafe { FindWindowW(w!("GloryPortPopupWnd"), PCWSTR::null()) }
+}
+
+fn lparam_xy(l: LPARAM) -> (i32, i32) {
+    let v = l.0 as u32;
+    (((v & 0xFFFF) as u16) as i32, ((v >> 16) as u16) as i32)
+}
+
+// ── Pintado con doble buffer GDI ─────────────────────────────────────────────
+
+fn paint(hwnd: HWND) {
+    unsafe {
+        let mut ps = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_invalid() {
+            return;
+        }
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let w = rc.right - rc.left;
+        let h = rc.bottom - rc.top;
+        let mem = CreateCompatibleDC(Some(hdc));
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, bmp.into());
+
+        if let Ok(guard) = STATE.lock() {
+            if let Some(state) = guard.as_ref() {
+                draw_all(mem, w, h, state);
+            }
+        }
+
+        let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+        let _ = SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn draw_all(dc: HDC, w: i32, h: i32, state: &PopupState) {
+    unsafe {
+        let ui = &UI;
+        let layout = Layout::new(state.ports.len());
+
+        // Fondo crema + borde tinta de 2 px (la región de ventana recorta las esquinas).
+        let _ = SelectObject(dc, ui.brush_cream.into());
+        let _ = SelectObject(dc, ui.pen_ink2.into());
+        let _ = RoundRect(dc, 1, 1, w - 1, h - 1, CORNER_RADIUS * 2, CORNER_RADIUS * 2);
+
+        // Cabecera: título EB Garamond + badge Forest con el conteo.
+        let header_top = BORDER + PAD_TOP;
+        let header_rect = RECT {
+            left: PAD_X,
+            top: header_top,
+            right: w - PAD_X,
+            bottom: header_top + HEADER_H,
+        };
+        text(
+            dc,
+            ui.fonts.garamond_20,
+            "GLORYPORT",
+            header_rect,
+            INK,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let badge = badge_text(state.ports.len(), state.extra_count);
+        let badge_rect = pill_rect(dc, ui.fonts.figtree_500_11, &badge, w, header_top, HEADER_H);
+        round_pill(dc, badge_rect, ui.brush_forest, ui.pen_ink2);
+        text(
+            dc,
+            ui.fonts.figtree_500_11,
+            &badge,
+            badge_rect,
+            CREAM,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        // Divisor bajo la cabecera (1 px Lumen Stone).
+        let divider = RECT {
+            left: PAD_X,
+            top: header_top + HEADER_H - 1,
+            right: w - PAD_X,
+            bottom: header_top + HEADER_H,
+        };
+        let _ = FillRect(dc, &divider, ui.brush_stone);
+
+        // Filas de puertos (con scroll si hace falta).
+        let rows_total = state.ports.len();
+        for vis in 0..layout.rows_visible {
+            let row_rect = layout.row_rect(vis);
+            let idx = state.scroll + vis;
+            if idx >= rows_total {
+                if rows_total == 0 && vis == 0 {
+                    text(
+                        dc,
+                        ui.fonts.figtree_400_13,
+                        "Sin puertos TCP en escucha",
+                        row_rect,
+                        FOG,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+                continue;
+            }
+            draw_row(dc, ui, &layout, &row_rect, state, idx);
+            if vis + 1 < layout.rows_visible {
+                let sep = RECT {
+                    left: PAD_X,
+                    top: row_rect.bottom - 1,
+                    right: w - PAD_X,
+                    bottom: row_rect.bottom,
+                };
+                let _ = FillRect(dc, &sep, ui.brush_stone);
+            }
+        }
+
+        if layout.has_scroll {
+            draw_scrollbar(dc, ui, &layout, state);
+        }
+
+        // Pie: Actualizar lista, Iniciar con Windows (toggle), Acerca de y Salir.
+        draw_footer(dc, ui, &layout, state);
+    }
+}
+
+fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupState, idx: usize) {
+    unsafe {
+        let row = &state.ports[idx];
+        if state.hover == Some(Hit::Row(idx)) {
+            let pill = RECT {
+                left: PAD_X - 6,
+                top: row_rect.top + 3,
+                right: layout.content_right() + 6,
+                bottom: row_rect.bottom - 3,
+            };
+            round_pill(dc, pill, ui.brush_lavender, ui.pen_lavender2);
+        }
+
+        let pid_text = row.pid.to_string();
+        let pid_right = layout.content_right();
+        let pid_rect = RECT {
+            left: pid_right - 54,
+            top: row_rect.top,
+            right: pid_right,
+            bottom: row_rect.bottom,
+        };
+        text(
+            dc,
+            ui.fonts.figtree_400_12,
+            &pid_text,
+            pid_rect,
+            FOG,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        let port_rect = RECT {
+            left: PAD_X,
+            top: row_rect.top,
+            right: PAD_X + 46,
+            bottom: row_rect.bottom,
+        };
+        text(
+            dc,
+            ui.fonts.figtree_600_14,
+            &row.port.to_string(),
+            port_rect,
+            INK,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        let name_rect = RECT {
+            left: PAD_X + 50,
+            top: row_rect.top,
+            right: pid_rect.left - 6,
+            bottom: row_rect.bottom,
+        };
+        text(
+            dc,
+            ui.fonts.figtree_400_13,
+            &row.process_name,
+            name_rect,
+            INK,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+}
+
+fn draw_footer(dc: HDC, ui: &Ui, layout: &Layout, state: &PopupState) {
+    unsafe {
+        let items = [
+            ("Actualizar lista", Hit::Refresh),
+            ("Iniciar con Windows", Hit::ToggleAutostart),
+            ("Acerca de", Hit::About),
+        ];
+        for (i, (label, hit)) in items.iter().enumerate() {
+            let item_rect = RECT {
+                left: PAD_X,
+                top: layout.footer_top + i as i32 * FOOTER_ITEM_H,
+                right: layout.width - PAD_X,
+                bottom: layout.footer_top + (i as i32 + 1) * FOOTER_ITEM_H,
+            };
+            if state.hover == Some(*hit) {
+                let pill = RECT {
+                    left: PAD_X - 6,
+                    top: item_rect.top + 3,
+                    right: layout.width - PAD_X + 6,
+                    bottom: item_rect.bottom - 3,
+                };
+                round_pill(dc, pill, ui.brush_lavender, ui.pen_lavender2);
+            }
+            text(
+                dc,
+                ui.fonts.figtree_400_13,
+                label,
+                item_rect,
+                INK,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if *hit == Hit::ToggleAutostart {
+                draw_toggle(dc, ui, &item_rect, state.autostart_on);
+            }
+        }
+
+        // Botón primario "Salir": lavanda, borde tinta 2 px, radio 12.
+        let salir = RECT {
+            left: PAD_X,
+            top: layout.salir_top,
+            right: layout.width - PAD_X,
+            bottom: layout.salir_top + SALIR_H,
+        };
+        let _ = SelectObject(dc, ui.brush_lavender.into());
+        let _ = SelectObject(dc, ui.pen_ink2.into());
+        let _ = RoundRect(dc, salir.left, salir.top, salir.right, salir.bottom, 24, 24);
+        text(
+            dc,
+            ui.fonts.figtree_500_13,
+            "Salir",
+            salir,
+            INK,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
+}
+
+fn draw_toggle(dc: HDC, ui: &Ui, item_rect: &RECT, on: bool) {
+    unsafe {
+        let label = if on { "SÍ" } else { "NO" };
+        let (tw, _) = measure(dc, ui.fonts.figtree_500_11, label);
+        let pw = tw + 14;
+        let ph = 18;
+        let pill = RECT {
+            left: item_rect.right - pw,
+            top: item_rect.top + (item_rect.bottom - item_rect.top - ph) / 2,
+            right: item_rect.right,
+            bottom: item_rect.top + (item_rect.bottom - item_rect.top - ph) / 2 + ph,
+        };
+        if on {
+            round_pill(dc, pill, ui.brush_forest, ui.pen_ink2);
+            text(
+                dc,
+                ui.fonts.figtree_500_11,
+                label,
+                pill,
+                CREAM,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        } else {
+            round_pill(dc, pill, ui.brush_cream, ui.pen_stone2);
+            text(
+                dc,
+                ui.fonts.figtree_500_11,
+                label,
+                pill,
+                INK,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+    }
+}
+
+fn draw_scrollbar(dc: HDC, ui: &Ui, layout: &Layout, state: &PopupState) {
+    unsafe {
+        let track = RECT {
+            left: layout.width - BORDER - SCROLL_W - 3,
+            top: layout.rows_top + 2,
+            right: layout.width - BORDER - 3,
+            bottom: layout.rows_bottom - 2,
+        };
+        let _ = FillRect(dc, &track, ui.brush_stone);
+
+        let total = state.ports.len().max(1);
+        let thumb_h = ((track.bottom - track.top) * total.min(MAX_VISIBLE_ROWS) as i32
+            / total as i32)
+            .max(16);
+        let travel = (track.bottom - track.top - thumb_h).max(0);
+        let thumb_top = if layout.max_scroll > 0 {
+            track.top + travel * state.scroll as i32 / layout.max_scroll as i32
+        } else {
+            track.top
+        };
+        let thumb = RECT {
+            left: track.left,
+            top: thumb_top,
+            right: track.right,
+            bottom: thumb_top + thumb_h,
+        };
+        let _ = FillRect(dc, &thumb, ui.brush_ink);
+    }
+}
+
+/// Pill redondeada al mínimo de sus dimensiones (radio completo en los extremos).
+unsafe fn round_pill(dc: HDC, rc: RECT, brush: HBRUSH, pen: HPEN) {
+    let d = (rc.right - rc.left).min(rc.bottom - rc.top);
+    let _ = SelectObject(dc, brush.into());
+    let _ = SelectObject(dc, pen.into());
+    let _ = RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, d, d);
+}
+
+/// Rect de la pill de cabecera, alineada a la derecha y centrada verticalmente.
+fn pill_rect(dc: HDC, font: HFONT, label: &str, w: i32, top: i32, h: i32) -> RECT {
+    let (tw, _) = unsafe { measure(dc, font, label) };
+    let pw = tw + 16;
+    let ph = 20;
+    let y = top + (h - ph) / 2;
+    RECT {
+        left: w - PAD_X - pw,
+        top: y,
+        right: w - PAD_X,
+        bottom: y + ph,
+    }
+}
+
+unsafe fn text(dc: HDC, font: HFONT, s: &str, rc: RECT, color: COLORREF, flags: DRAW_TEXT_FORMAT) {
+    let mut buf: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = SetTextColor(dc, color);
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let old = SelectObject(dc, font.into());
+    let mut r = rc;
+    let _ = DrawTextW(dc, &mut buf, &mut r, flags);
+    let _ = SelectObject(dc, old);
+}
+
+unsafe fn measure(dc: HDC, font: HFONT, s: &str) -> (i32, i32) {
+    let buf: Vec<u16> = s.encode_utf16().collect();
+    let old = SelectObject(dc, font.into());
+    let mut size = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &buf, &mut size);
+    let _ = SelectObject(dc, old);
+    (size.cx, size.cy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(y: i32) -> (i32, i32) {
+        (PAD_X, y)
+    }
+
+    #[test]
+    fn layout_grows_with_rows_and_caps_visible() {
+        let empty = Layout::new(0);
+        assert_eq!(empty.rows_visible, 1);
+        assert_eq!(empty.max_scroll, 0);
+
+        let five = Layout::new(5);
+        assert_eq!(five.rows_visible, 5);
+        assert_eq!(five.max_scroll, 0);
+        assert!(!five.has_scroll);
+        assert_eq!(five.height, 5 * ROW_H + 190);
+
+        let nine = Layout::new(9);
+        assert_eq!(nine.rows_visible, MAX_VISIBLE_ROWS);
+        assert_eq!(nine.max_scroll, 1);
+        assert!(nine.has_scroll);
+    }
+
+    #[test]
+    fn hit_test_rows_footer_and_exit() {
+        let layout = Layout::new(8);
+        assert_eq!(
+            hit_test(row(layout.rows_top + 5), &layout, 0, 8),
+            Hit::Row(0)
+        );
+        assert_eq!(
+            hit_test(row(layout.rows_top + ROW_H + 5), &layout, 0, 8),
+            Hit::Row(1)
+        );
+        assert_eq!(
+            hit_test(row(layout.footer_top + 5), &layout, 0, 8),
+            Hit::Refresh
+        );
+        assert_eq!(
+            hit_test(row(layout.footer_top + FOOTER_ITEM_H + 5), &layout, 0, 8),
+            Hit::ToggleAutostart
+        );
+        assert_eq!(
+            hit_test(
+                row(layout.footer_top + 2 * FOOTER_ITEM_H + 5),
+                &layout,
+                0,
+                8
+            ),
+            Hit::About
+        );
+        assert_eq!(
+            hit_test((PAD_X + 10, layout.salir_top + 10), &layout, 0, 8),
+            Hit::Exit
+        );
+        assert_eq!(hit_test((2, 2), &layout, 0, 8), Hit::None);
+    }
+
+    #[test]
+    fn hit_test_applies_scroll_and_ignores_empty_rows() {
+        let layout = Layout::new(9);
+        let bottom = layout.rows_top + (MAX_VISIBLE_ROWS as i32 - 1) * ROW_H + 5;
+        assert_eq!(hit_test(row(bottom), &layout, 0, 9), Hit::Row(7));
+        assert_eq!(hit_test(row(bottom), &layout, 1, 9), Hit::Row(8));
+        assert_eq!(hit_test(row(bottom), &layout, 1, 0), Hit::None);
+    }
+
+    #[test]
+    fn clamp_pos_keeps_window_inside_work_area() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(clamp_pos(0, 0, 300, 400, work), (0, 0));
+        assert_eq!(clamp_pos(1800, 900, 300, 400, work), (1620, 640));
+        assert_eq!(clamp_pos(-50, -20, 300, 400, work), (0, 0));
+    }
+
+    #[test]
+    fn wheel_scroll_is_bounded() {
+        assert_eq!(scroll_step(0, 120, 5), 0);
+        assert_eq!(scroll_step(2, 120, 5), 0);
+        assert_eq!(scroll_step(0, -120, 5), 3);
+        assert_eq!(scroll_step(4, -120, 5), 5);
+        assert_eq!(scroll_step(5, -120, 5), 5);
+    }
+
+    #[test]
+    fn badge_shows_plus_when_truncated() {
+        assert_eq!(badge_text(3, 0), "3 TCP");
+        assert_eq!(badge_text(60, 5), "60+ TCP");
+    }
+
+    #[test]
+    fn truncate_ports_keeps_cap_and_count() {
+        let rows: Vec<PortInfo> = (0..65).map(port).collect();
+        let (kept, extra) = truncate_ports(rows);
+        assert_eq!(kept.len(), MAX_TOTAL_ROWS);
+        assert_eq!(extra, 5);
+    }
+
+    fn port(n: u16) -> PortInfo {
+        PortInfo {
+            port: n,
+            pid: u32::from(n) + 100,
+            address: "0.0.0.0".into(),
+            process_name: "node.exe".into(),
+        }
+    }
+}
