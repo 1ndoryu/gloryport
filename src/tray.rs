@@ -105,7 +105,8 @@ pub fn run() -> Result<(), String> {
         // TaskbarCreated: Explorer recrea la bandeja tras reiniciar o colgarse.
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
-        // Bucle de mensajes: termina con WM_QUIT (Salir o cierre del sistema).
+        // Bucle de mensajes: termina con WM_QUIT (cierre del sistema; aún no hay
+        // acción Salir en la UI — vía de salida pendiente en 128A-14).
         let mut msg = MSG::default();
         loop {
             let r = GetMessageW(&mut msg, None, 0, 0);
