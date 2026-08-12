@@ -14,8 +14,11 @@ pub fn is_protected_pid(pid: u32) -> bool {
     pid == 0 || pid == 4 || pid == unsafe { GetCurrentProcessId() }
 }
 
-/// Nombre base del ejecutable de un PID, o `None` si no es accesible.
-pub fn resolve_process_name(pid: u32) -> Option<String> {
+/// Ruta completa del ejecutable de un PID, o `None` si no es accesible.
+///
+/// Devuelve el path real (p. ej. `C:\Program Files\nodejs\node.exe`), que permite
+/// distinguir aplicaciones de usuario de procesos del sistema sin depender del nombre.
+pub fn resolve_process_path(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -35,8 +38,7 @@ pub fn resolve_process_name(pid: u32) -> Option<String> {
     if !ok {
         return None;
     }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,9 +112,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_own_process_name() {
-        let name = resolve_process_name(unsafe { GetCurrentProcessId() });
-        // El runner de tests siempre puede consultar su propio nombre.
-        assert!(name.is_some(), "debería resolverse el nombre propio");
+    fn resolve_own_process_path() {
+        let path = resolve_process_path(unsafe { GetCurrentProcessId() });
+        assert!(
+            path.as_deref().is_some_and(|p| p.ends_with(".exe")),
+            "el runner de tests debería resolver su ruta completa"
+        );
     }
 }

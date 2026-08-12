@@ -7,7 +7,9 @@
 //! vivo al cerrar el popup.
 
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -48,21 +50,20 @@ const FOREST: COLORREF = COLORREF(0x0046_4F03); // Forest Ink: badges/acento
 const STONE: COLORREF = COLORREF(0x00D0_E4E4); // Lumen Stone: divisores
 const FOG: COLORREF = COLORREF(0x0080_8A8A); // Fog: texto secundario
 
-// ── Layout compacto (píxeles, base 8) ─────────────────────────────────────────
-const WIDTH: i32 = 300;
+// ── Layout (píxeles): aire generoso, sin cabecera ni insignia ─────────────────
+const WIDTH: i32 = 340;
 const BORDER: i32 = 2;
-const PAD_X: i32 = 12;
-const PAD_TOP: i32 = 10;
-const HEADER_H: i32 = 40;
-const ROW_H: i32 = 30;
-const FOOTER_GAP: i32 = 8;
-const FOOTER_ITEM_H: i32 = 26;
-const SALIR_GAP: i32 = 8;
-const SALIR_H: i32 = 32;
-const PAD_BOTTOM: i32 = 10;
+const PAD_X: i32 = 14;
+const PAD_TOP: i32 = 12;
+const ROW_H: i32 = 34;
+const FOOTER_GAP: i32 = 10;
+const FOOTER_ITEM_H: i32 = 28;
+const SALIR_GAP: i32 = 10;
+const SALIR_H: i32 = 36;
+const PAD_BOTTOM: i32 = 12;
 const CORNER_RADIUS: i32 = 14;
 const SCROLL_W: i32 = 4;
-const MAX_VISIBLE_ROWS: usize = 8;
+const MAX_VISIBLE_ROWS: usize = 9;
 /// Tope de filas de puertos (mismo límite que el menú nativo de v1).
 const MAX_TOTAL_ROWS: usize = 60;
 const WHEEL_STEP: usize = 3;
@@ -107,7 +108,7 @@ impl Layout {
     fn new(rows_total: usize) -> Self {
         let rows_visible = rows_total.clamp(1, MAX_VISIBLE_ROWS);
         let max_scroll = rows_total.saturating_sub(rows_visible);
-        let rows_top = BORDER + PAD_TOP + HEADER_H;
+        let rows_top = BORDER + PAD_TOP;
         let rows_bottom = rows_top + rows_visible as i32 * ROW_H;
         let footer_top = rows_bottom + FOOTER_GAP;
         let salir_top = footer_top + 3 * FOOTER_ITEM_H + SALIR_GAP;
@@ -195,19 +196,9 @@ fn scroll_step(current: usize, wheel_delta: i32, max: usize) -> usize {
     }
 }
 
-/// Texto del badge del conteo: `N TCP`, o `N+ TCP` si se truncó la lista.
-fn badge_text(count: usize, extra: usize) -> String {
-    if extra > 0 {
-        format!("{count}+ TCP")
-    } else {
-        format!("{count} TCP")
-    }
-}
-
 // ── Estado y recursos GDI (un solo popup a la vez, mismo hilo) ───────────────
 struct PopupState {
     ports: Vec<PortInfo>,
-    extra_count: usize,
     autostart_on: bool,
     action: Option<Action>,
     hover: Option<Hit>,
@@ -218,6 +209,9 @@ struct PopupState {
 
 static STATE: Mutex<Option<PopupState>> = Mutex::new(None);
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+/// Época (ms) del último cierre del popup: el clic de bandeja que lo cerró puede
+/// llegar después y no debe reabrirlo (carrera clásica de menús de bandeja).
+static LAST_CLOSED_MS: AtomicU64 = AtomicU64::new(0);
 
 struct Ui {
     brush_cream: HBRUSH,
@@ -258,7 +252,7 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
     }
     unsafe {
         register_class();
-        let (ports, extra_count) = truncate_ports(ports);
+        let ports = truncate_ports(ports);
         let layout = Layout::new(ports.len());
         let (x, y) = popup_position(layout.width, layout.height);
         let Some(hinstance) = hinstance() else {
@@ -297,7 +291,6 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
 
         *STATE.lock().unwrap() = Some(PopupState {
             ports,
-            extra_count,
             autostart_on,
             action: None,
             hover: None,
@@ -327,6 +320,7 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
         }
 
         let _ = DestroyWindow(hwnd);
+        record_close();
         // Si llegó un WM_QUIT externo, se re-encola para que el bucle de la bandeja salga.
         if let Some(code) = quit_code {
             PostQuitMessage(code);
@@ -339,6 +333,32 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
         .and_then(|s| s.action)
         .unwrap_or(Action::None);
     action
+}
+
+/// Registra el cierre del popup con la hora actual (ms desde la época).
+fn record_close() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    LAST_CLOSED_MS.store(now, Ordering::Relaxed);
+}
+
+/// ¿Cerró un popup hace menos de `within`? Si es así, el clic de bandeja que se
+/// está procesando probablemente es el mismo gesto que provocó el cierre y se
+/// consume sin reabrir.
+pub fn closed_recently(within: Duration) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_CLOSED_MS.load(Ordering::Relaxed);
+    was_recent(now, last, within.as_millis() as u64)
+}
+
+/// Función pura del filtro temporal, testeable sin reloj real.
+fn was_recent(now_ms: u64, last_ms: u64, within_ms: u64) -> bool {
+    last_ms != 0 && now_ms.saturating_sub(last_ms) <= within_ms
 }
 
 /// ¿Hay un popup abierto en este momento?
@@ -398,16 +418,8 @@ fn popup_position(w: i32, h: i32) -> (i32, i32) {
     }
 }
 
-fn truncate_ports(ports: Vec<PortInfo>) -> (Vec<PortInfo>, usize) {
-    let total = ports.len();
-    if total > MAX_TOTAL_ROWS {
-        (
-            ports.into_iter().take(MAX_TOTAL_ROWS).collect(),
-            total - MAX_TOTAL_ROWS,
-        )
-    } else {
-        (ports, 0)
-    }
+fn truncate_ports(ports: Vec<PortInfo>) -> Vec<PortInfo> {
+    ports.into_iter().take(MAX_TOTAL_ROWS).collect()
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -619,43 +631,6 @@ fn draw_all(dc: HDC, w: i32, h: i32, state: &PopupState) {
         let _ = SelectObject(dc, ui.pen_ink2.into());
         let _ = RoundRect(dc, 1, 1, w - 1, h - 1, CORNER_RADIUS * 2, CORNER_RADIUS * 2);
 
-        // Cabecera: título EB Garamond + badge Forest con el conteo.
-        let header_top = BORDER + PAD_TOP;
-        let header_rect = RECT {
-            left: PAD_X,
-            top: header_top,
-            right: w - PAD_X,
-            bottom: header_top + HEADER_H,
-        };
-        text(
-            dc,
-            ui.fonts.garamond_20,
-            "GLORYPORT",
-            header_rect,
-            INK,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        let badge = badge_text(state.ports.len(), state.extra_count);
-        let badge_rect = pill_rect(dc, ui.fonts.figtree_500_11, &badge, w, header_top, HEADER_H);
-        round_pill(dc, badge_rect, ui.brush_forest, ui.pen_ink2);
-        text(
-            dc,
-            ui.fonts.figtree_500_11,
-            &badge,
-            badge_rect,
-            CREAM,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-
-        // Divisor bajo la cabecera (1 px Lumen Stone).
-        let divider = RECT {
-            left: PAD_X,
-            top: header_top + HEADER_H - 1,
-            right: w - PAD_X,
-            bottom: header_top + HEADER_H,
-        };
-        let _ = FillRect(dc, &divider, ui.brush_stone);
-
         // Filas de puertos (con scroll si hace falta).
         let rows_total = state.ports.len();
         for vis in 0..layout.rows_visible {
@@ -711,7 +686,7 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
         let pid_text = row.pid.to_string();
         let pid_right = layout.content_right();
         let pid_rect = RECT {
-            left: pid_right - 54,
+            left: pid_right - 64,
             top: row_rect.top,
             right: pid_right,
             bottom: row_rect.bottom,
@@ -722,13 +697,13 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
             &pid_text,
             pid_rect,
             FOG,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
         let port_rect = RECT {
             left: PAD_X,
             top: row_rect.top,
-            right: PAD_X + 46,
+            right: PAD_X + 56,
             bottom: row_rect.bottom,
         };
         text(
@@ -741,7 +716,7 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
         );
 
         let name_rect = RECT {
-            left: PAD_X + 50,
+            left: PAD_X + 60,
             top: row_rect.top,
             right: pid_rect.left - 6,
             bottom: row_rect.bottom,
@@ -888,20 +863,6 @@ unsafe fn round_pill(dc: HDC, rc: RECT, brush: HBRUSH, pen: HPEN) {
     let _ = RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, d, d);
 }
 
-/// Rect de la pill de cabecera, alineada a la derecha y centrada verticalmente.
-fn pill_rect(dc: HDC, font: HFONT, label: &str, w: i32, top: i32, h: i32) -> RECT {
-    let (tw, _) = unsafe { measure(dc, font, label) };
-    let pw = tw + 16;
-    let ph = 20;
-    let y = top + (h - ph) / 2;
-    RECT {
-        left: w - PAD_X - pw,
-        top: y,
-        right: w - PAD_X,
-        bottom: y + ph,
-    }
-}
-
 unsafe fn text(dc: HDC, font: HFONT, s: &str, rc: RECT, color: COLORREF, flags: DRAW_TEXT_FORMAT) {
     let mut buf: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = SetTextColor(dc, color);
@@ -939,12 +900,12 @@ mod tests {
         assert_eq!(five.rows_visible, 5);
         assert_eq!(five.max_scroll, 0);
         assert!(!five.has_scroll);
-        assert_eq!(five.height, 5 * ROW_H + 190);
+        assert_eq!(five.height, 5 * ROW_H + 168);
 
         let nine = Layout::new(9);
         assert_eq!(nine.rows_visible, MAX_VISIBLE_ROWS);
-        assert_eq!(nine.max_scroll, 1);
-        assert!(nine.has_scroll);
+        assert_eq!(nine.max_scroll, 0);
+        assert!(!nine.has_scroll);
     }
 
     #[test]
@@ -984,10 +945,10 @@ mod tests {
 
     #[test]
     fn hit_test_applies_scroll_and_ignores_empty_rows() {
-        let layout = Layout::new(9);
+        let layout = Layout::new(10);
         let bottom = layout.rows_top + (MAX_VISIBLE_ROWS as i32 - 1) * ROW_H + 5;
-        assert_eq!(hit_test(row(bottom), &layout, 0, 9), Hit::Row(7));
-        assert_eq!(hit_test(row(bottom), &layout, 1, 9), Hit::Row(8));
+        assert_eq!(hit_test(row(bottom), &layout, 0, 10), Hit::Row(8));
+        assert_eq!(hit_test(row(bottom), &layout, 1, 10), Hit::Row(9));
         assert_eq!(hit_test(row(bottom), &layout, 1, 0), Hit::None);
     }
 
@@ -1014,17 +975,17 @@ mod tests {
     }
 
     #[test]
-    fn badge_shows_plus_when_truncated() {
-        assert_eq!(badge_text(3, 0), "3 TCP");
-        assert_eq!(badge_text(60, 5), "60+ TCP");
+    fn truncate_ports_keeps_cap() {
+        let rows: Vec<PortInfo> = (0..65).map(port).collect();
+        let kept = truncate_ports(rows);
+        assert_eq!(kept.len(), MAX_TOTAL_ROWS);
     }
 
     #[test]
-    fn truncate_ports_keeps_cap_and_count() {
-        let rows: Vec<PortInfo> = (0..65).map(port).collect();
-        let (kept, extra) = truncate_ports(rows);
-        assert_eq!(kept.len(), MAX_TOTAL_ROWS);
-        assert_eq!(extra, 5);
+    fn close_suppression_only_after_a_real_close() {
+        assert!(!was_recent(5_000, 0, 250)); // sin cierre previo
+        assert!(was_recent(5_100, 5_000, 250)); // clic del mismo gesto
+        assert!(!was_recent(5_500, 5_000, 250)); // gesto nuevo, fuera de la ventana
     }
 
     fn port(n: u16) -> PortInfo {
@@ -1033,6 +994,7 @@ mod tests {
             pid: u32::from(n) + 100,
             address: "0.0.0.0".into(),
             process_name: "node.exe".into(),
+            process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
         }
     }
 }

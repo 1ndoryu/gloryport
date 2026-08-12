@@ -5,6 +5,7 @@
 //! se mantiene ~0% cuando la app está inactiva.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -186,6 +187,10 @@ unsafe extern "system" fn wnd_proc(
 unsafe fn toggle_or_show_menu(hwnd: HWND) {
     if popup::is_open() {
         popup::cancel_active();
+    } else if popup::closed_recently(Duration::from_millis(250)) {
+        // El popup acaba de cerrarse por este mismo gesto (el DOWN activó la
+        // bandeja y cerró el popup; el UP llega después). Consumir el clic evita
+        // que se reabra al instante.
     } else {
         show_menu(hwnd);
     }
@@ -251,6 +256,9 @@ unsafe fn show_menu(hwnd: HWND) {
             ports::attach_process_names(&mut ports, &mut cache);
         }
     }
+    // Solo aplicaciones de usuario: los servicios del sistema y los procesos sin
+    // nombre resoluble no deben ofrecerse al kill desde la bandeja.
+    ports = ports::solo_aplicaciones(ports);
 
     match popup::show(hwnd, ports, autostart::is_enabled()) {
         Action::None => {}

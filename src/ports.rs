@@ -33,6 +33,9 @@ pub struct PortInfo {
     pub pid: u32,
     pub address: String,
     pub process_name: String,
+    /// Ruta completa del ejecutable (p. ej. `C:\Program Files\nodejs\node.exe`).
+    /// `None` cuando el proceso ya no existe o Windows niega el acceso.
+    pub process_path: Option<String>,
 }
 
 impl PortInfo {
@@ -42,6 +45,7 @@ impl PortInfo {
             pid: row.dwOwningPid,
             address: ipv4_to_string(row.dwLocalAddr),
             process_name: String::new(),
+            process_path: None,
         }
     }
 
@@ -51,6 +55,7 @@ impl PortInfo {
             pid: row.dwOwningPid,
             address: ipv6_to_string(&row.ucLocalAddr),
             process_name: String::new(),
+            process_path: None,
         }
     }
 }
@@ -80,13 +85,50 @@ pub fn scan_listeners() -> Result<Vec<PortInfo>, ScanError> {
 /// Adjunta el nombre del proceso a cada fila usando una caché con TTL.
 pub fn attach_process_names(rows: &mut [PortInfo], cache: &mut NameCache) {
     for row in rows.iter_mut() {
-        row.process_name = cache.get(row.pid);
+        let (name, path) = cache.get(row.pid);
+        row.process_name = name;
+        row.process_path = path;
     }
+}
+
+/// Filtra la lista dejando solo puertos de **aplicaciones de usuario**.
+///
+/// Regla: puerto ≥ 1024 (los inferiores son privilegiados/servicios de Windows) y
+/// ejecutable resoluble **fuera** de la carpeta Windows. Esto oculta servicios del
+/// sistema (svchost, System, RPC…) y procesos muertos/sin permiso ("desconocido"),
+/// que nunca deben cerrarse desde la bandeja.
+pub fn solo_aplicaciones(rows: Vec<PortInfo>) -> Vec<PortInfo> {
+    rows.into_iter().filter(es_puerto_de_aplicacion).collect()
+}
+
+fn es_puerto_de_aplicacion(row: &PortInfo) -> bool {
+    if row.port < 1024 {
+        return false;
+    }
+    row.process_path
+        .as_deref()
+        .is_some_and(|p| !es_ruta_del_sistema(p))
+}
+
+/// ¿La ruta está dentro de la carpeta Windows del sistema (case-insensitive)?
+fn es_ruta_del_sistema(path: &str) -> bool {
+    let root = std::env::var("SystemRoot")
+        .unwrap_or_else(|_| "C:\\Windows".to_string())
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let p = path.trim_end_matches('\\').to_ascii_lowercase();
+    p == root || p.starts_with(&format!("{root}\\"))
 }
 
 /// Caché acotada de nombres de proceso: evita llamadas Win32 repetidas.
 pub struct NameCache {
-    entries: HashMap<u32, (String, Instant)>,
+    entries: HashMap<u32, ResolvedProcess>,
+}
+
+struct ResolvedProcess {
+    name: String,
+    path: Option<String>,
+    at: Instant,
 }
 
 impl Default for NameCache {
@@ -102,24 +144,33 @@ impl NameCache {
         }
     }
 
-    pub fn get(&mut self, pid: u32) -> String {
-        if let Some((name, created)) = self.entries.get(&pid) {
-            if created.elapsed() < NAME_CACHE_TTL {
-                return name.clone();
+    pub fn get(&mut self, pid: u32) -> (String, Option<String>) {
+        if let Some(entry) = self.entries.get(&pid) {
+            if entry.at.elapsed() < NAME_CACHE_TTL {
+                return (entry.name.clone(), entry.path.clone());
             }
         }
-        let name = process::resolve_process_name(pid).unwrap_or_else(|| "desconocido".to_string());
-        self.entries.insert(pid, (name.clone(), Instant::now()));
+        // Una sola apertura del proceso resuelve ruta y nombre derivado.
+        let path = process::resolve_process_path(pid);
+        let name = path
+            .as_deref()
+            .map(|p| p.rsplit('\\').next().unwrap_or(p).to_string())
+            .unwrap_or_else(|| "desconocido".to_string());
+        let entry = ResolvedProcess {
+            name: name.clone(),
+            path: path.clone(),
+            at: Instant::now(),
+        };
+        self.entries.insert(pid, entry);
         self.evict_if_needed();
-        name
+        (name, path)
     }
 
     fn evict_if_needed(&mut self) {
         if self.entries.len() <= NAME_CACHE_MAX {
             return;
         }
-        self.entries
-            .retain(|_, (_, created)| created.elapsed() < NAME_CACHE_TTL);
+        self.entries.retain(|_, e| e.at.elapsed() < NAME_CACHE_TTL);
         if self.entries.len() > NAME_CACHE_MAX {
             // Caso límite (muchos PIDs nuevos): resetear evita crecer sin tope.
             self.entries.clear();
@@ -337,24 +388,28 @@ mod tests {
                 pid: 100,
                 address: "0.0.0.0".into(),
                 process_name: String::new(),
+                process_path: None,
             },
             PortInfo {
                 port: 80,
                 pid: 4,
                 address: "0.0.0.0".into(),
                 process_name: String::new(),
+                process_path: None,
             },
             PortInfo {
                 port: 3000,
                 pid: 100,
                 address: "[::]".into(),
                 process_name: String::new(),
+                process_path: None,
             },
             PortInfo {
                 port: 3000,
                 pid: 101,
                 address: "127.0.0.1".into(),
                 process_name: String::new(),
+                process_path: None,
             },
         ];
         dedupe_and_sort(&mut rows);
@@ -368,8 +423,38 @@ mod tests {
     #[test]
     fn name_cache_evicts_and_reuses() {
         let mut cache = NameCache::new();
-        let a = cache.get(u32::MAX); // PID improbable: resuelve "desconocido"
+        let (a, path) = cache.get(u32::MAX); // PID improbable: sin ruta ni nombre
         assert_eq!(a, "desconocido");
+        assert!(path.is_none());
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn filtro_solo_aplicaciones() {
+        fn row(port: u16, path: Option<&str>) -> PortInfo {
+            PortInfo {
+                port,
+                pid: 1000,
+                address: "0.0.0.0".into(),
+                process_name: String::new(),
+                process_path: path.map(str::to_string),
+            }
+        }
+
+        let rows = vec![
+            row(80, Some(r"C:\Windows\System32\svchost.exe")), // servicio web/sistema
+            row(135, None),                                    // RPC sin nombre resoluble
+            row(445, Some(r"C:\Windows\System32\srvnet.sys")), // SMB (path Windows)
+            row(49664, Some(r"C:\Windows\System32\svchost.exe")), // RPC dinámico
+            row(3000, Some(r"C:\Program Files\nodejs\node.exe")), // app de usuario
+            row(5432, Some(r"C:\Program Files\PostgreSQL\bin\postgres.exe")),
+            row(8080, None), // proceso muerto/sin permiso: no confirmable
+            row(80, Some(r"C:\Program Files\nodejs\node.exe")), // puerto privilegiado
+            row(9000, Some(r"c:\windows\system32\dwm.exe")), // case-insensitive
+        ];
+
+        let kept = solo_aplicaciones(rows);
+        let kept_ports: Vec<u16> = kept.iter().map(|r| r.port).collect();
+        assert_eq!(kept_ports, vec![3000, 5432]);
     }
 }

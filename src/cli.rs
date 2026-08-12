@@ -53,6 +53,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
 fn cmd_list(args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
+    let include_system = args.iter().any(|a| a == "--incluir-sistema");
+    if let Some(unknown) = args
+        .iter()
+        .find(|a| a.as_str() != "--json" && a.as_str() != "--incluir-sistema")
+    {
+        errln!("gloryport: opción desconocida '{unknown}'");
+        return ExitCode::from(2);
+    }
     let mut rows = match ports::scan_listeners() {
         Ok(rows) => rows,
         Err(e) => {
@@ -61,6 +69,10 @@ fn cmd_list(args: &[String]) -> ExitCode {
         }
     };
     ports::attach_process_names(&mut rows, &mut ports::NameCache::new());
+    // Por defecto solo aplicaciones de usuario; el sistema se ve con --incluir-sistema.
+    if !include_system {
+        rows = ports::solo_aplicaciones(rows);
+    }
 
     if json {
         match serde_json::to_string_pretty(&rows) {
@@ -187,6 +199,7 @@ fn print_usage() {
          \x20 gloryport tray       igual que el anterior, explícito\n\
          \x20 gloryport list       lista puertos en escucha (tabla)\n\
          \x20 gloryport list --json  ídem en JSON\n\
+         \x20 gloryport list --incluir-sistema  incluye servicios y puertos del sistema\n\
          \x20 gloryport kill <puerto> [--pid <PID>]  termina el proceso del puerto\n\
          \x20 gloryport --version  versión\n\
          \x20 gloryport --help     esta ayuda",
