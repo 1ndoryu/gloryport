@@ -58,17 +58,19 @@ popup incluye:
 
 - **Actualizar**: re-escanea la tabla TCP.
 - **Auto-inicio**: activa/desactiva el arranque con Windows (HKCU).
-- **Acerca de**: versión y stack.
-- **Salir**: cierre limpio (elimina icono, ventana y mutex).
 
 Si hay más de 60 puertos, el popup se desplaza con la rueda del ratón (máx. 9 filas
 visibles). No hay cabecera ni contador: el popup es compacto y se abre sobre el cursor.
+El cursor se mantiene como flecha al pasar por encima (sin el cursor de espera que
+aparecía antes) y, si la ruta del proceso no cabe en la fila, se recorta por el principio
+conservando el final (`…\codex-bridge\bridge\server.js` en vez de cortar la cola).
 
 ### Filtro de aplicaciones
 
 Por defecto el popup y `list` muestran solo **aplicaciones de usuario**: puerto ≥ 1024 y
 ejecutable resuelto fuera de `C:\Windows`. Los servicios del sistema (PID 0/4, `svchost`,
-`lsass`, etc.) no aparecen porque no deben cerrarse. Para ver todo en la CLI:
+`lsass`, etc.) y los sincronizadores de fondo (p. ej. `GoogleDriveFS.exe`, ignorado por
+blocklist) no aparecen porque no deben cerrarse. Para ver todo en la CLI:
 
 ```powershell
 gloryport list --incluir-sistema
@@ -78,6 +80,13 @@ El "desconocido" que aparecía antes en el popup eran procesos que murieron entr
 y la consulta del nombre, o servicios del sistema sin acceso de lectura (p. ej. de otro
 usuario). Con `QueryFullProcessImageNameW` ahora se resuelve la ruta completa del ejecutable
 y, con el filtro aplicado, esos procesos ya no se muestran en el popup.
+
+Para los intérpretes (`node.exe`, `bun.exe`, `deno…`) la columna PROCESO muestra el script
+que realmente sirve el puerto, leído de la línea de comandos del proceso (PEB vía
+`NtQueryInformationProcess`, sin WMI ni procesos hijos): `…\codex-bridge\bridge\server.js`
+en vez de `node.exe`. La etiqueta se deriva del proceso real de cada escaneo — no hay un
+mapa puerto→aplicación — porque una misma app puede ocupar puertos distintos en días
+distintos.
 
 > Nota: al invocar la CLI desde PowerShell, el binario usa subsistema gráfico (sin ventana
 > de consola al arrancar como app); si una salida se ve truncada por el host, usa `cmd /c`
@@ -99,9 +108,10 @@ Ejemplo:
 
 ```text
 PUERTO  DIRECCIÓN             PID      PROCESO
-3101    127.0.0.1             17484    node.exe
-5173    [::1]                 12336    node.exe
-7679    [::1]                 10040    GoogleDriveFS.exe
+3101    127.0.0.1             10068    …\server\dist\index.js
+4100    127.0.0.1             8924     …\codex-bridge\bridge\server.js
+5173    [::1]                 12336    …\vite\bin\vite.js
+49351   127.0.0.1             22144    esrv.exe
 ```
 
 Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso denegado),
@@ -118,10 +128,10 @@ Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso de
 
 | Chequeo | Resultado |
 |---|---|
-| `cargo test` | 21/21 OK (18 unit + 3 E2E con puerto real) |
+| `cargo test` | 24/24 OK (21 unit + 3 E2E con puerto real) |
 | `cargo clippy --all-targets -- -D warnings` | OK |
 | `cargo fmt --check` | OK |
-| Smoke bandeja | Icono en bandeja; clic físico abre el popup 340×474 en < 130 ms, estable, 2.º clic cierra sin reabrir |
+| Smoke bandeja | Icono en bandeja; clic físico abre el popup 340×400 en < 130 ms, estable, 2.º clic cierra sin reabrir |
 | RAM en bandeja | WorkingSet ~10 MB / privada ~1,5 MB, 4 hilos |
 | `gloryport list` (release) | instantáneo con el filtro de aplicaciones |
 | Binario release | 350.208 bytes (~342 KB), autocontenido (icono + fuentes) |
@@ -138,8 +148,8 @@ Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso de
 
 ## Hoja de ruta futura
 
-Vigilancia de puertos configurados, instalador ligero/firma, línea de comando del proceso en
-el tooltip — detalle y prioridad en [roadmap.md](roadmap.md).
+Vigilancia de puertos configurados, instalador ligero/firma y re-verificación del PID justo
+antes del kill — detalle y prioridad en [roadmap.md](roadmap.md).
 
 ## Licencia
 

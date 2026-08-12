@@ -1,6 +1,7 @@
 # GLORYPORT — Arquitectura y plan
 
-Fecha: 2026-08-12 · Estado: v1.2 implementada (popup amplio + filtro de aplicaciones) · Fuente de decisión
+Fecha: 2026-08-12 · Estado: v1.3 implementada (popup compacto, cmdline de intérpretes,
+blocklist y elipsis al inicio) · Fuente de decisión
 canónica: este documento.
 
 ## 1. Contexto y objetivo
@@ -128,6 +129,7 @@ pub struct PortInfo {
     pub address: String,    // "0.0.0.0", "127.0.0.1", "[::1]"
     pub process_name: String, // nombre base del ejecutable, con caché TTL
     pub process_path: Option<String>, // ruta completa del ejecutable (None: sin permiso/muerto)
+    pub process_cmd: Option<String>,  // línea de comandos completa (None: sin permiso/muerto)
 }
 ```
 
@@ -138,19 +140,45 @@ Reglas:
 - Orden: puerto ascendente; estable para el usuario.
 - Límite de visibilidad en menú: 60 entradas (máx. 9 filas visibles, scroll de rueda).
 - La ruta se resuelve con `QueryFullProcessImageNameW` (permisos mínimos
-  `PROCESS_QUERY_LIMITED_INFORMATION`); una sola apertura del proceso devuelve nombre y ruta.
+  `PROCESS_QUERY_LIMITED_INFORMATION`) y la línea de comandos con
+  `NtQueryInformationProcess` + `ReadProcessMemory` sobre el PEB (x64,
+  `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, sin WMI ni procesos hijos); una sola
+  apertura del proceso devuelve nombre, ruta y cmdline.
+
+### Etiqueta visible y cmdline (128A-12)
+
+`ports::etiqueta_visible()` muestra el "programa real" de cada fila:
+
+- Para intérpretes (`node.exe`, `bun.exe`, `deno…`), busca el primer argumento de la
+  línea de comandos con extensión de script (`js/mjs/cjs/ts/mts/cts`), normaliza la ruta
+  (colapsa `.` y `..`) y la acorta a sus últimos 3 componentes: `…\codex-bridge\bridge\server.js`.
+- Para el resto, el nombre base del ejecutable (`esrv.exe`, `Code.exe`, `Freebuff.exe`).
+- La etiqueta se deriva del proceso real de cada escaneo: **nunca** hay un mapa
+  puerto→aplicación, porque una misma app puede ocupar puertos distintos en días distintos.
+
+La cmdline también se expone en `list --json` (`process_cmd`) para scripting.
+
+### Elipsis al inicio (128A-12)
+
+`DT_BEGINNING_ELLIPSIS` no existe en Win32, así que `popup.rs` recorta por el principio con
+`text_leading_ellipsis()`: mide el texto con `GetTextExtentPoint32W` y, si no cabe en la
+fila, busca por búsqueda binaria la cola más larga que quepa anteponiendo `…`. Resultado:
+cuando la ruta no cabe se ve el **final** (`…\bridge\server.js`) y no el comienzo.
 
 ### Filtro "solo aplicaciones" (128A-10)
 
 El popup y `list` aplican `ports::solo_aplicaciones()`: se muestra una fila solo si
 `puerto >= 1024` **y** la ruta resuelta cae **fuera** de `C:\Windows` (comparación
-case-insensitive contra `SystemRoot`). Consecuencias:
+case-insensitive contra `SystemRoot`) **y** el proceso no está en la blocklist
+(`PROCESOS_EXCLUIDOS`, p. ej. `googledrivefs.exe`). Consecuencias:
 
 - Los servicios del sistema (PID 0/4, `svchost`, `lsass`, `TermService`, etc.) y los
   puertos comunes (< 1024) no aparecen en el popup: no tienen sentido como objetivo de kill.
 - Los procesos muertos entre el escaneo y la consulta, o sin permiso de lectura (otro
   usuario/SYSTEM), tienen `process_path = None` y también quedan ocultos: es la eliminación
   del "desconocido" del popup.
+- Los sincronizadores/auxiliares de fondo que cumplirían el filtro pero nunca deben
+  cerrarse (GoogleDriveFS) quedan excluidos por blocklist.
 - `gloryport list --incluir-sistema` desactiva el filtro (ver todo, incluidos los no
   resueltos como "desconocido").
 
@@ -163,7 +191,7 @@ carpeta ocultaría los servidores de los proyectos.
 | Recurso | Estrategia |
 |---|---|
 | CPU | Sin timers. Escaneo solo bajo demanda (apertura de menú o CLI). |
-| RAM | Una sola tabla escaneada; caché de nombres+ruta con TTL 10 s y tope de 512 entradas. |
+| RAM | Una sola tabla escaneada; caché de nombre+ruta+cmdline con TTL 10 s y tope de 512 entradas. |
 | Procesos hijos | Cero: todas las operaciones vía API Win32. |
 | Arranque | Mutex de instancia única + registro de clase + `Shell_NotifyIcon`; sin red. |
 | Disco | El binario es autocontenido (icono y fuentes embebidas). |
@@ -198,13 +226,15 @@ Objetivos medibles (v1, verificados en §10):
   usuario; el valor apunta al ejecutable actual entre comillas.
 - Single-instance por mutex de sesión; la segunda instancia notifica a la primera y sale.
 - Sin red, sin datos del usuario fuera de la clave Run, sin elevación.
+- Lectura de cmdline solo con permisos de consulta/lectura de memoria; falla (None) ante
+  procesos de sistema u otro usuario, sin elevar privilegios.
 
 ## 9. Estrategia de pruebas
 
 1. **Unitarias**: formateo de dirección IP (v4/v6), decodificación de puerto (network byte
    order), dedupe/orden, layout del popup (altura, filas visibles, scroll, hit-test),
    construcción de etiquetas, parseo de args CLI, filtro `solo_aplicaciones`, supresión de
-   reapertura del segundo clic.
+   reapertura del segundo clic, cmdline del propio proceso (PEB) y elipsis al inicio.
 2. **Integración E2E** (en `tests/`): el binario auxiliar `gloryport-test-helper` ocupa un
    puerto real; se verifica que `list` lo muestra y que `kill` lo libera (el proceso termina
    y el puerto queda libre).
@@ -226,16 +256,18 @@ Objetivos medibles (v1, verificados en §10):
 | P4 | Cierre: docs, roadmap, completados, commit final | Hecho |
 | P7 | Popup Wispr Flow (GDI, fuentes embebidas) + fix clic físico del icono | Hecho |
 | P8 | Popup amplio sin título/contador + filtro solo-aplicaciones + fix carrera del 2.º clic | Hecho |
-| P5 (futuro) | Refresco automático configurable, puertos vigilados, PID→línea de comando | Pendiente (roadmap) |
+| P9 | Popup sin Salir/Acerca, fix cursor de espera, blocklist (GoogleDriveFS), cmdline de intérpretes (node/bun) y elipsis al inicio | Hecho |
+| P5 (futuro) | Refresco automático configurable, puertos vigilados | Pendiente (roadmap) |
 | P6 (futuro) | Instalador ligero / firma de código, actualización | Pendiente (roadmap) |
 
 ## 11. Definition of Done (v1)
 
 - `gloryport tray`: icono en bandeja, menú con puertos reales, kill con notificación,
   auto-inicio verificable, single-instance, cierre limpio.
-- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (340×474, sin
-  cabecera ni contador), se mantiene estable sin interacción y el segundo clic o un clic
-  fuera lo cierra sin reabrir.
+- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (340×400, sin
+  cabecera ni contador, sin Salir/Acerca), el cursor se mantiene como flecha al pasar por
+  encima, se mantiene estable sin interacción y el segundo clic o un clic fuera lo cierra
+  sin reabrir.
 - `gloryport list`: tabla correcta (puerto, dirección, PID, proceso), `--json` y
   `--incluir-sistema` para ver servicios del sistema.
 - `gloryport kill <puerto>`: termina el/los proceso(s) y reporta resultado con exit code.
