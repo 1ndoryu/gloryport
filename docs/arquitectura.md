@@ -1,6 +1,6 @@
 # GLORYPORT — Arquitectura y plan
 
-Fecha: 2026-08-12 · Estado: v1.1 implementada (popup Wispr Flow) · Fuente de decisión
+Fecha: 2026-08-12 · Estado: v1.2 implementada (popup amplio + filtro de aplicaciones) · Fuente de decisión
 canónica: este documento.
 
 ## 1. Contexto y objetivo
@@ -79,6 +79,8 @@ sequenceDiagram
     U->>T: clic derecho/izquierdo en icono
     T->>P: scan_listeners()
     P-->>T: Vec<PortInfo> ordenado (1 llamada Win32)
+    T->>P: attach_process_names() + solo_aplicaciones()
+    P-->>T: filas filtradas (aplicaciones de usuario)
     T->>M: show(puertos, autostart)
     M-->>T: Action elegida
     T->>K: kill_pid(pid) / toggle autostart / salir
@@ -98,10 +100,20 @@ rompe el clic físico (los mensajes `PostMessage` de prueba sí llegaban limpios
 el bug). Además, un clic real entrega `WM_LBUTTONDOWN`/`WM_LBUTTONUP` y un `NIN_SELECT`
 (`WM_USER`) que debe ignorarse; el clic derecho entrega `WM_CONTEXTMENU`.
 
-El popup **no usa captura de ratón**: si capturara, el segundo clic en el icono cerraba el
-popup por la captura y el shell reenviaba el `WM_LBUTTONUP` que lo reabría. Sin captura, el
-segundo clic llega al icono y `toggle_or_show_menu` lo cierra; el cierre por clic fuera se
-resuelve con `WM_ACTIVATE` (`WA_INACTIVE`), como un menú nativo.
+El popup **no usa captura de ratón** (si capturara, el segundo clic en el icono cerraba el
+popup por la captura y el shell reenviaba el `WM_LBUTTONUP` que lo reabría). El cierre por
+clic fuera se resuelve con `WM_ACTIVATE` (`WA_INACTIVE`), como un menú nativo.
+
+### Carrera del segundo clic (cerrar → reabrir)
+
+Un clic en el icono mientras el popup está abierto genera dos eventos: el *DOWN* sobre la
+bandeja desactiva el popup (`WM_ACTIVATE` → cierre) y el *UP* posterior llega al callback de
+bandeja (`WM_APP_TRAY`) cuando el popup ya está cerrado, reabriéndolo al instante (verificado
+en smoke: el HWND del popup cambiaba en la misma posición). El fix es una **ventana de
+supresión** de 250 ms: `popup::record_close()` registra la hora del último cierre y
+`toggle_or_show_menu()` consume el clic de bandeja que llega justo después de un cierre
+reciente en vez de reabrir. No afecta a "Actualizar lista", que reabre el popup por la vía
+interna (`show_menu`) y no por un clic de bandeja.
 
 Si Explorer se reinicia, el shell envía `TaskbarCreated` (mensaje registrado con
 `RegisterWindowMessageW`); el tray vuelve a llamar `Shell_NotifyIconW(NIM_ADD)` con la
@@ -115,6 +127,7 @@ pub struct PortInfo {
     pub pid: u32,           // PID del proceso dueño
     pub address: String,    // "0.0.0.0", "127.0.0.1", "[::1]"
     pub process_name: String, // nombre base del ejecutable, con caché TTL
+    pub process_path: Option<String>, // ruta completa del ejecutable (None: sin permiso/muerto)
 }
 ```
 
@@ -123,15 +136,34 @@ Reglas:
 - Se deduplica por `(port, pid)`: si un mismo proceso escucha en IPv4 e IPv6, aparece una
   sola fila.
 - Orden: puerto ascendente; estable para el usuario.
-- Límite de visibilidad en menú: 60 entradas; si hay más, se indica con un item informativo.
-- PID 0/4 (System) se listan pero su kill devuelve error controlado (permisos).
+- Límite de visibilidad en menú: 60 entradas (máx. 9 filas visibles, scroll de rueda).
+- La ruta se resuelve con `QueryFullProcessImageNameW` (permisos mínimos
+  `PROCESS_QUERY_LIMITED_INFORMATION`); una sola apertura del proceso devuelve nombre y ruta.
+
+### Filtro "solo aplicaciones" (128A-10)
+
+El popup y `list` aplican `ports::solo_aplicaciones()`: se muestra una fila solo si
+`puerto >= 1024` **y** la ruta resuelta cae **fuera** de `C:\Windows` (comparación
+case-insensitive contra `SystemRoot`). Consecuencias:
+
+- Los servicios del sistema (PID 0/4, `svchost`, `lsass`, `TermService`, etc.) y los
+  puertos comunes (< 1024) no aparecen en el popup: no tienen sentido como objetivo de kill.
+- Los procesos muertos entre el escaneo y la consulta, o sin permiso de lectura (otro
+  usuario/SYSTEM), tienen `process_path = None` y también quedan ocultos: es la eliminación
+  del "desconocido" del popup.
+- `gloryport list --incluir-sistema` desactiva el filtro (ver todo, incluidos los no
+  resueltos como "desconocido").
+
+El criterio es "aplicaciones de usuario" y no "solo la carpeta `area-trabajo`": los binarios
+de desarrollo (`node.exe`, `bun.exe`) viven en `Program Files` y un filtro estricto por
+carpeta ocultaría los servidores de los proyectos.
 
 ## 6. Estrategia de recursos
 
 | Recurso | Estrategia |
 |---|---|
 | CPU | Sin timers. Escaneo solo bajo demanda (apertura de menú o CLI). |
-| RAM | Una sola tabla escaneada; caché de nombres con TTL 10 s y tope de 512 entradas. |
+| RAM | Una sola tabla escaneada; caché de nombres+ruta con TTL 10 s y tope de 512 entradas. |
 | Procesos hijos | Cero: todas las operaciones vía API Win32. |
 | Arranque | Mutex de instancia única + registro de clase + `Shell_NotifyIcon`; sin red. |
 | Disco | El binario es autocontenido (icono y fuentes embebidas). |
@@ -171,14 +203,15 @@ Objetivos medibles (v1, verificados en §10):
 
 1. **Unitarias**: formateo de dirección IP (v4/v6), decodificación de puerto (network byte
    order), dedupe/orden, layout del popup (altura, filas visibles, scroll, hit-test),
-   construcción de etiquetas, parseo de args CLI.
+   construcción de etiquetas, parseo de args CLI, filtro `solo_aplicaciones`, supresión de
+   reapertura del segundo clic.
 2. **Integración E2E** (en `tests/`): el binario auxiliar `gloryport-test-helper` ocupa un
    puerto real; se verifica que `list` lo muestra y que `kill` lo libera (el proceso termina
    y el puerto queda libre).
-3. **Smoke de bandeja**: arrancar `gloryport tray`, verificar ventana oculta creada,
-   proceso vivo, segunda instancia que sale sola, y cierre limpio. Con un clic físico real
-   (`SendInput` con coordenadas absolutas sobre el icono) el popup abre en < 50 ms, se
-   mantiene estable y el segundo clic lo cierra sin reabrir.
+3. **Smoke de bandeja** (`tools/smoke-tray.ps1`): arrancar `gloryport tray`, encontrar el
+   icono por UIA, clic físico real (`SendInput` con coordenadas absolutas sobre el icono),
+   verificar popup visible, capturar PNG y confirmar que el segundo clic lo cierra sin
+   reabrir (sonda HWND/rect antes y después para distinguir cierre de reapertura).
 4. **Gate**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
    build release, ejecutar el binario release para `list`.
 
@@ -192,6 +225,7 @@ Objetivos medibles (v1, verificados en §10):
 | P3 | Calidad: tests, clippy, E2E real, smoke tray, release | Hecho |
 | P4 | Cierre: docs, roadmap, completados, commit final | Hecho |
 | P7 | Popup Wispr Flow (GDI, fuentes embebidas) + fix clic físico del icono | Hecho |
+| P8 | Popup amplio sin título/contador + filtro solo-aplicaciones + fix carrera del 2.º clic | Hecho |
 | P5 (futuro) | Refresco automático configurable, puertos vigilados, PID→línea de comando | Pendiente (roadmap) |
 | P6 (futuro) | Instalador ligero / firma de código, actualización | Pendiente (roadmap) |
 
@@ -199,9 +233,11 @@ Objetivos medibles (v1, verificados en §10):
 
 - `gloryport tray`: icono en bandeja, menú con puertos reales, kill con notificación,
   auto-inicio verificable, single-instance, cierre limpio.
-- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (< 50 ms), se
-  mantiene estable sin interacción y el segundo clic o un clic fuera lo cierra.
-- `gloryport list`: tabla correcta (puerto, dirección, PID, proceso) y `--json`.
+- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (340×474, sin
+  cabecera ni contador), se mantiene estable sin interacción y el segundo clic o un clic
+  fuera lo cierra sin reabrir.
+- `gloryport list`: tabla correcta (puerto, dirección, PID, proceso), `--json` y
+  `--incluir-sistema` para ver servicios del sistema.
 - `gloryport kill <puerto>`: termina el/los proceso(s) y reporta resultado con exit code.
 - Gate verde (fmt, clippy `-D warnings`, tests unit + E2E) y smoke de bandeja aprobado.
 - Documentación (este archivo, README, roadmap, plan) coherente con la implementación.

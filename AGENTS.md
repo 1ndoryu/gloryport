@@ -37,8 +37,10 @@ bandeja, smoke con clic físico sobre el icono). Un commit solo con gate verde.
 
 ## Estructura
 
-- `src/ports.rs` — escáner `GetExtendedTcpTable` + resolución de nombres de proceso.
-- `src/process.rs` — terminación de procesos (`OpenProcess`/`TerminateProcess`).
+- `src/ports.rs` — escáner `GetExtendedTcpTable` + resolución de nombre/ruta de proceso +
+  filtro `solo_aplicaciones` (puerto ≥ 1024 y ejecutable fuera de `C:\Windows`).
+- `src/process.rs` — ruta del ejecutable (`QueryFullProcessImageNameW`) y terminación de
+  procesos (`OpenProcess`/`TerminateProcess`).
 - `src/tray.rs` — bandeja del sistema, eventos (clic/`TaskbarCreated`), notificaciones,
   single-instance.
 - `src/popup.rs` — popup Wispr Flow pintado con GDI (layout, scroll, hit-test, acción).
@@ -47,4 +49,6 @@ bandeja, smoke con clic físico sobre el icono). Un commit solo con gate verde.
 - `src/icon.rs` — icono embebido (ICO → `HICON`).
 - `src/cli.rs` — modos `list`, `kill`, `tray`, `--version`.
 - `tools/make-fonts.py` — genera los TTFs embebidos desde las variables oficiales.
+- `tools/smoke-tray.ps1` — smoke de bandeja con clic físico (`SendInput`), captura PNG y
+  verificación de cierre sin reapertura.
 - `docs/arquitectura.md` — decisión de diseño y plan.
