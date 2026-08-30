@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
@@ -19,22 +19,27 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateRoundRectRgn,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HPEN, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PS_SOLID, SRCCOPY, TRANSPARENT,
+    SetTextColor, SetWindowRgn, DRAW_TEXT_FORMAT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, HDC, HFONT, HPEN, MONITORINFO, MONITOR_DEFAULTTONEAREST, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Controls::{
+    NMHDR, NMTTDISPINFOW, TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTDT_INITIAL, TTDT_RESHOW, TTF_ABSOLUTE,
+    TTF_IDISHWND, TTF_TRACK, TTM_ADDTOOLW, TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH, TTM_SETTIPBKCOLOR,
+    TTM_SETTIPTEXTCOLOR, TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTN_NEEDTEXTW,
+    TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
     GetCursorPos, GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetCursor, SetForegroundWindow, ShowWindow, TranslateMessage, HCURSOR, IDC_ARROW, MSG,
-    SW_SHOWNOACTIVATE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SendMessageW, SetCursor, SetForegroundWindow, ShowWindow, TranslateMessage, CW_USEDEFAULT,
+    HCURSOR, IDC_ARROW, MSG, SW_SHOWNOACTIVATE, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT,
+    WM_SETCURSOR, WM_SETFONT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::fonts;
@@ -52,11 +57,11 @@ const STONE: COLORREF = COLORREF(0x00D0_E4E4); // Lumen Stone: divisores
 const FOG: COLORREF = COLORREF(0x0080_8A8A); // Fog: texto secundario
 
 // ── Layout (píxeles): aire generoso, sin cabecera ni insignia ─────────────────
-const WIDTH: i32 = 340;
+const WIDTH: i32 = 520;
 const BORDER: i32 = 2;
 const PAD_X: i32 = 14;
 const PAD_TOP: i32 = 12;
-const ROW_H: i32 = 34;
+const ROW_H: i32 = 38;
 const FOOTER_GAP: i32 = 10;
 const FOOTER_ITEM_H: i32 = 28;
 const PAD_BOTTOM: i32 = 12;
@@ -66,6 +71,14 @@ const MAX_VISIBLE_ROWS: usize = 9;
 /// Tope de filas de puertos (mismo límite que el menú nativo de v1).
 const MAX_TOTAL_ROWS: usize = 60;
 const WHEEL_STEP: usize = 3;
+/// El tooltip no envuelve: la ruta completa se muestra en una sola línea.
+const TOOLTIP_MAX_WIDTH: i32 = 0;
+/// Retardo inicial antes de mostrar el tooltip (ms): evita destellos al pasar.
+const TOOLTIP_INITIAL_MS: u32 = 350;
+/// El tooltip permanece visible hasta 12 s o hasta que el ratón se vaya.
+const TOOLTIP_AUTOPOP_MS: u32 = 12_000;
+/// Reaparición rápida al moverse de una fila a otra.
+const TOOLTIP_RESHOW_MS: u32 = 100;
 
 /// Acción elegida por el usuario en el popup.
 #[derive(Debug)]
@@ -189,7 +202,18 @@ struct PopupState {
     scroll: usize,
     done: bool,
     tracking: bool,
+    /// Tooltip de filas (hwnd raw) que muestra la ruta completa bajo el cursor.
+    tooltip: Option<usize>,
+    /// `TTTOOLINFOW` registrada con `TTM_ADDTOOLW`, necesaria para
+    /// `TTM_TRACKACTIVATE`. Solo se toca desde el hilo de la UI.
+    tool_ti: Option<ToolTi>,
 }
+
+/// Envuelve la `TTTOOLINFOW` del tooltip para poder guardarla en el estado
+/// (`Mutex` exige `Send`). Contiene punteros raw, pero solo se usa desde el hilo
+/// de la UI del popup; `unsafe impl` es seguro por ese invariante.
+struct ToolTi(TTTOOLINFOW);
+unsafe impl Send for ToolTi {}
 
 static STATE: Mutex<Option<PopupState>> = Mutex::new(None);
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -277,7 +301,7 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
             let _ = SetWindowRgn(hwnd, Some(rgn), true);
         }
 
-        *STATE.lock().unwrap() = Some(PopupState {
+        let mut state = PopupState {
             ports,
             autostart_on,
             action: None,
@@ -285,7 +309,14 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
             scroll: 0,
             done: false,
             tracking: false,
-        });
+            tooltip: None,
+            tool_ti: None,
+        };
+        if let Some((hwnd_tooltip, tool_ti)) = create_row_tooltip(hwnd) {
+            state.tooltip = Some(hwnd_tooltip.0 as usize);
+            state.tool_ti = Some(tool_ti);
+        }
+        *STATE.lock().unwrap() = Some(state);
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetForegroundWindow(hwnd);
@@ -307,6 +338,7 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
             let _ = DispatchMessageW(&msg);
         }
 
+        let _ = destroy_row_tooltip();
         let _ = DestroyWindow(hwnd);
         record_close();
         // Si llegó un WM_QUIT externo, se re-encola para que el bucle de la bandeja salga.
@@ -366,6 +398,119 @@ pub fn cancel_active() {
             }
         }
     }
+}
+
+/// Destruye el tooltip de filas (hijo del popup) si sigue vivo.
+unsafe fn destroy_row_tooltip() -> bool {
+    let guard = STATE.lock().unwrap();
+    let Some(tooltip) = guard.as_ref().and_then(|s| s.tooltip) else {
+        return false;
+    };
+    let hwnd = HWND(tooltip as *mut core::ffi::c_void);
+    let _ = DestroyWindow(hwnd);
+    true
+}
+
+/// Crea el tooltip de filas (hijo del popup, estilo TTS_NOPREFIX) que muestra la
+/// ruta completa. Es un tooltip "track": se posiciona y se activa/desactiva
+/// explícitamente desde `set_hover`, sin depender de que el control subclasee al
+/// popup (fallo observado con el tooltip clásico: no aparecía). Devuelve el hwnd
+/// y la `TTTOOLINFOW` registrada (guardada en el estado del popup).
+unsafe fn create_row_tooltip(parent: HWND) -> Option<(HWND, ToolTi)> {
+    let hinstance = hinstance()?;
+    let hwnd = CreateWindowExW(
+        Default::default(),
+        TOOLTIPS_CLASSW,
+        PCWSTR::null(),
+        // TTS_ALWAYSTIP: el tooltip se muestra aunque el popup no esté activo.
+        // TTS_NOPREFIX: no interpreta '&' como acelerador en las rutas.
+        WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        Some(parent),
+        None,
+        Some(hinstance),
+        None,
+    )
+    .ok()?;
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETFONT,
+        Some(WPARAM(fonts::get().figtree_400_13.0 as usize)),
+        Some(LPARAM(1)),
+    );
+    // 0 = el tooltip no envuelve; la ruta se muestra en una sola línea completa.
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETMAXTIPWIDTH,
+        Some(WPARAM(0)),
+        Some(LPARAM(TOOLTIP_MAX_WIDTH as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETDELAYTIME,
+        Some(WPARAM(TTDT_INITIAL as usize)),
+        Some(LPARAM(TOOLTIP_INITIAL_MS as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETDELAYTIME,
+        Some(WPARAM(TTDT_AUTOPOP as usize)),
+        Some(LPARAM(TOOLTIP_AUTOPOP_MS as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETDELAYTIME,
+        Some(WPARAM(TTDT_RESHOW as usize)),
+        Some(LPARAM(TOOLTIP_RESHOW_MS as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETTIPBKCOLOR,
+        Some(WPARAM(INK.0 as usize)),
+        Some(LPARAM(0)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        TTM_SETTIPTEXTCOLOR,
+        Some(WPARAM(CREAM.0 as usize)),
+        Some(LPARAM(0)),
+    );
+    // TTF_IDISHWND: el tooltip pertenece al popup y las notificaciones de texto
+    // (TTN_NEEDTEXTW) llegan a `wnd_proc`; no se subclasea ningún control hijo.
+    // TTF_TRACK|TTF_ABSOLUTE: el tooltip se posiciona y se activa/desactiva
+    // explícitamente desde `set_hover` (plan robusto: no depende de que el
+    // control detecte el rect por sí solo).
+    let ti = TTTOOLINFOW {
+        cbSize: size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE,
+        hwnd: parent,
+        uId: parent.0 as usize,
+        // LPSTR_TEXTCALLBACK: sin texto fijo; el control pide el texto por
+        // TTN_NEEDTEXTW en cada fila. Con lpszText = NULL no habría nada que
+        // mostrar y el tooltip jamás aparecería.
+        lpszText: PWSTR(-1isize as *mut u16),
+        rect: RECT {
+            left: 0,
+            top: 0,
+            right: WIDTH,
+            bottom: MAX_VISIBLE_ROWS as i32 * ROW_H + PAD_TOP + BORDER,
+        },
+        ..Default::default()
+    };
+    let ti_ptr = &ti as *const TTTOOLINFOW as usize;
+    let _ = SendMessageW(
+        hwnd,
+        TTM_ADDTOOLW,
+        Some(WPARAM(0)),
+        Some(LPARAM(ti_ptr as isize)),
+    );
+    Some((hwnd, ToolTi(ti)))
 }
 
 unsafe fn hinstance() -> Option<HINSTANCE> {
@@ -453,6 +598,13 @@ unsafe extern "system" fn wnd_proc(
             on_lbuttonup(hwnd, lparam);
             LRESULT(0)
         }
+        WM_NOTIFY => {
+            if on_notify(lparam) {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         WM_KEYDOWN => {
             on_key(hwnd, wparam);
             LRESULT(0)
@@ -495,6 +647,42 @@ fn on_lbuttonup(hwnd: HWND, lparam: LPARAM) {
     let hit = current_hit(x, y);
     let action = action_for(hit);
     finish(hwnd, action);
+}
+
+/// Sirve el texto del tooltip de filas (`TTN_NEEDTEXTW`): copia la ruta completa
+/// al buffer fijo `szText` del propio mensaje, sin punteros a memoria propia.
+fn on_notify(lparam: LPARAM) -> bool {
+    unsafe {
+        let nm = &*(lparam.0 as *const NMHDR);
+        let Ok(hwnd) = popup_hwnd() else {
+            return false;
+        };
+        if nm.idFrom != hwnd.0 as usize {
+            return false;
+        }
+        if nm.code != TTN_NEEDTEXTW {
+            return false;
+        }
+        let info = &mut *(lparam.0 as *mut NMTTDISPINFOW);
+        let guard = STATE.lock().unwrap();
+        let Some(state) = guard.as_ref() else {
+            return false;
+        };
+        let text = state
+            .hover
+            .and_then(|hit| match hit {
+                Hit::Row(idx) => state.ports.get(idx),
+                _ => None,
+            })
+            .map(crate::ports::etiqueta_visible)
+            .unwrap_or_default();
+        let mut wide = text.encode_utf16();
+        for slot in info.szText.iter_mut() {
+            *slot = wide.next().unwrap_or(0);
+        }
+        info.lpszText = PWSTR(info.szText.as_mut_ptr());
+        true
+    }
 }
 
 fn on_key(hwnd: HWND, wparam: WPARAM) {
@@ -565,10 +753,65 @@ fn untrack() {
 
 fn set_hover(hwnd: HWND, hit: Option<Hit>) {
     let mut guard = STATE.lock().unwrap();
-    if let Some(s) = guard.as_mut() {
-        if s.hover != hit {
-            s.hover = hit;
-            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    if s.hover == hit {
+        return;
+    }
+    s.hover = hit;
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    // Tooltip "track": se posiciona junto al cursor (coordenadas de pantalla) y
+    // se activa/desactiva de forma explícita, sin depender de que el control
+    // subclasee al popup. El texto se actualiza aquí y también vía TTN_NEEDTEXTW.
+    if let (Some(tooltip), Some(tool_ti)) = (s.tooltip, s.tool_ti.as_ref()) {
+        let tooltip = HWND(tooltip as *mut core::ffi::c_void);
+        let ti_ptr = &tool_ti.0 as *const TTTOOLINFOW as usize;
+        match hit {
+            Some(Hit::Row(idx)) if idx < s.ports.len() => {
+                let label = crate::ports::etiqueta_visible(&s.ports[idx]);
+                let mut wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = unsafe {
+                    SendMessageW(
+                        tooltip,
+                        TTM_UPDATETIPTEXTW,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(wide.as_mut_ptr() as isize)),
+                    )
+                };
+                let mut pt = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut pt) };
+                pt.x += 16;
+                pt.y += 24;
+                let _ = unsafe {
+                    SendMessageW(
+                        tooltip,
+                        TTM_TRACKPOSITION,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(
+                            (((pt.y as u32) << 16) | ((pt.x as u32) & 0xFFFF)) as isize,
+                        )),
+                    )
+                };
+                let _ = unsafe {
+                    SendMessageW(
+                        tooltip,
+                        TTM_TRACKACTIVATE,
+                        Some(WPARAM(1)),
+                        Some(LPARAM(ti_ptr as isize)),
+                    )
+                };
+            }
+            _ => {
+                let _ = unsafe {
+                    SendMessageW(
+                        tooltip,
+                        TTM_TRACKACTIVATE,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(ti_ptr as isize)),
+                    )
+                };
+            }
         }
     }
 }
@@ -683,23 +926,6 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
             round_pill(dc, pill, ui.brush_lavender, ui.pen_lavender2);
         }
 
-        let pid_text = row.pid.to_string();
-        let pid_right = layout.content_right();
-        let pid_rect = RECT {
-            left: pid_right - 64,
-            top: row_rect.top,
-            right: pid_right,
-            bottom: row_rect.bottom,
-        };
-        text(
-            dc,
-            ui.fonts.figtree_400_12,
-            &pid_text,
-            pid_rect,
-            FOG,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-
         let port_rect = RECT {
             left: PAD_X,
             top: row_rect.top,
@@ -715,21 +941,32 @@ fn draw_row(dc: HDC, ui: &Ui, layout: &Layout, row_rect: &RECT, state: &PopupSta
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
 
+        // Sin PID en la fila (decisión del usuario): la etiqueta llega hasta el
+        // borde derecho del contenido. El PID sigue visible en el CLI/JSON.
         let name_rect = RECT {
             left: PAD_X + 60,
             top: row_rect.top,
-            right: pid_rect.left - 6,
+            right: layout.content_right(),
             bottom: row_rect.bottom,
         };
         // Elipsis al INICIO: cuando la ruta no cabe, se recorta el comienzo y se
         // conserva el final (lo identificable), en lugar de cortar la cola.
-        text_leading_ellipsis(
-            dc,
-            ui.fonts.figtree_400_13,
-            &crate::ports::etiqueta_visible(row),
-            name_rect,
-            INK,
-        );
+        let etiqueta = crate::ports::etiqueta_popup(row);
+        let (ancho, _) = measure(dc, ui.fonts.figtree_400_13, &etiqueta);
+        if ancho <= name_rect.right - name_rect.left {
+            // La ruta completa cabe en la fila: se dibuja entera.
+            text(
+                dc,
+                ui.fonts.figtree_400_13,
+                &etiqueta,
+                name_rect,
+                INK,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        } else {
+            // No cabe: se recorta el comienzo conservando el final identificable.
+            text_leading_ellipsis(dc, ui.fonts.figtree_400_13, &etiqueta, name_rect, INK);
+        }
     }
 }
 
@@ -1026,6 +1263,7 @@ mod tests {
             process_name: "node.exe".into(),
             process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
             process_cmd: None,
+            proyecto: None,
         }
     }
 }

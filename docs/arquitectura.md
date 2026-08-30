@@ -1,7 +1,8 @@
 # GLORYPORT — Arquitectura y plan
 
-Fecha: 2026-08-12 · Estado: v1.3 implementada (popup compacto, cmdline de intérpretes,
-blocklist y elipsis al inicio) · Fuente de decisión
+Fecha: 2026-08-13 · Estado: v1.4 implementada (popup amplio con ruta completa si cabe,
+tooltip con la ruta completa, clic en la bandeja por botón derecho, cmdline de
+intérpretes, blocklist y elipsis al inicio) · Fuente de decisión
 canónica: este documento.
 
 ## 1. Contexto y objetivo
@@ -158,12 +159,34 @@ Reglas:
 
 La cmdline también se expone en `list --json` (`process_cmd`) para scripting.
 
-### Elipsis al inicio (128A-12)
+### Elipsis al inicio y ruta completa (128A-12 / 128A-15)
 
 `DT_BEGINNING_ELLIPSIS` no existe en Win32, así que `popup.rs` recorta por el principio con
 `text_leading_ellipsis()`: mide el texto con `GetTextExtentPoint32W` y, si no cabe en la
 fila, busca por búsqueda binaria la cola más larga que quepa anteponiendo `…`. Resultado:
-cuando la ruta no cabe se ve el **final** (`…\bridge\server.js`) y no el comienzo.
+cuando la ruta no cabe se ve el **final** (`…\bridge\server.js`) y no el comienzo. Con el
+popup a 430 px de ancho, `draw_row` mide antes con `GetTextExtentPoint32W` y, si la ruta
+completa cabe en la fila, la dibuja entera.
+
+### Tooltip de filas con la ruta completa (128A-15)
+
+El tooltip clásico (subclase automática del popup) no aparecía; se reimplementó como
+**tooltip "track"**: `TOOLTIPS_CLASSW` hijo del popup con `TTS_ALWAYSTIP|TTS_NOPREFIX`,
+fuente Figtree 400 13, fondo INK / texto CREAM, delays 350/12 000/100 ms y
+`TTM_SETMAXTIPWIDTH=0` (una sola línea sin wrap). Se registra una `TTTOOLINFOW` con
+`TTF_IDISHWND|TTF_TRACK|TTF_ABSOLUTE` y `lpszText=LPSTR_TEXTCALLBACK`; al entrar en una
+fila, `set_hover` envía `TTM_UPDATETIPTEXTW` con la etiqueta completa, la posiciona junto
+al cursor (`TTM_TRACKPOSITION`) y la activa (`TTM_TRACKACTIVATE`); al salir, la desactiva.
+`TTN_NEEDTEXTW` copia la etiqueta al buffer fijo del propio mensaje (sin punteros a memoria
+propia) y `WM_NOTIFY` se maneja en `wnd_proc`. La `TTTOOLINFOW` se guarda en `PopupState`
+(`unsafe impl Send`, solo se toca desde el hilo de la UI) y se destruye antes del
+`DestroyWindow` del popup.
+
+### Clic de la bandeja con botón derecho (128A-15)
+
+`tray.rs` reenvía también `WM_RBUTTONUP` a `toggle_or_show_menu` (la misma vía que
+`WM_LBUTTONUP | WM_CONTEXTMENU`): con `NOTIFYICON_VERSION_4`, el callback empaqueta el
+mensaje de ratón en la palabra baja de `lParam`, y ambos botones abren el popup.
 
 ### Filtro "solo aplicaciones" (128A-10)
 
@@ -264,7 +287,9 @@ Objetivos medibles (v1, verificados en §10):
 
 - `gloryport tray`: icono en bandeja, menú con puertos reales, kill con notificación,
   auto-inicio verificable, single-instance, cierre limpio.
-- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (340×400, sin
+- Popup Wispr Flow: el clic físico abre el popup estilizado en el cursor (430×436 con 9
+  filas visibles de 38 px, sin cabecera ni contador, sin Salir/Acerca de), y el hover sobre
+  una fila muestra un tooltip con la ruta completa.
   cabecera ni contador, sin Salir/Acerca), el cursor se mantiene como flecha al pasar por
   encima, se mantiene estable sin interacción y el segundo clic o un clic fuera lo cierra
   sin reabrir.

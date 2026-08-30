@@ -21,8 +21,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
     GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    TranslateMessage, HICON, MSG, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WNDCLASSW,
-    WS_OVERLAPPED,
+    TranslateMessage, HICON, MSG, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::popup::Action;
@@ -164,6 +164,7 @@ unsafe extern "system" fn wnd_proc(
             let mouse_msg = lparam.0 as u32 & 0xFFFF;
             match mouse_msg {
                 WM_LBUTTONUP | WM_CONTEXTMENU => toggle_or_show_menu(hwnd),
+                WM_RBUTTONUP => toggle_or_show_menu(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -250,16 +251,17 @@ unsafe fn show_menu(hwnd: HWND) {
             return;
         }
     };
+    let cfg = crate::config::Config::load();
     {
         static NAME_CACHE: std::sync::LazyLock<std::sync::Mutex<ports::NameCache>> =
             std::sync::LazyLock::new(|| std::sync::Mutex::new(ports::NameCache::new()));
         if let Ok(mut cache) = NAME_CACHE.lock() {
-            ports::attach_process_names(&mut ports, &mut cache);
+            ports::attach_process_names(&mut ports, &mut cache, &cfg);
         }
     }
-    // Solo aplicaciones de usuario: los servicios del sistema y los procesos sin
-    // nombre resoluble no deben ofrecerse al kill desde la bandeja.
-    ports = ports::solo_aplicaciones(ports);
+    // Solo aplicaciones de usuario: los servicios del sistema, los procesos sin
+    // nombre resoluble y los ocultos por config no se ofrecen al kill.
+    ports = ports::solo_aplicaciones(ports, &cfg);
 
     match popup::show(hwnd, ports, autostart::is_enabled()) {
         Action::None => {}

@@ -26,8 +26,15 @@ const NAME_CACHE_MAX: usize = 512;
 /// TTL de la caché: evita abrir el mismo proceso repetidamente entre aperturas del menú.
 const NAME_CACHE_TTL: Duration = Duration::from_secs(10);
 /// Procesos que nunca se ofrecen al kill aunque cumplan el filtro de aplicación:
-/// son sincronizadores/auxiliares del sistema que no deben cerrarse desde la bandeja.
-const PROCESOS_EXCLUIDOS: &[&str] = &["googledrivefs.exe"];
+/// sincronizadores del sistema y apps del entorno (Intel, la propia Freebuff) que
+/// no deben cerrarse desde la bandeja. También acepta scripts (p. ej. el
+/// orchestrator.js de Freebuff, que corre bajo bun.exe).
+const PROCESOS_EXCLUIDOS: &[&str] = &[
+    "googledrivefs.exe", // sincronizador del sistema
+    "esrv.exe",          // Intel SUR/actualizador: no es del workspace
+    "freebuff.exe",      // la propia app Freebuff
+    "orchestrator.js",   // orquestador interno de Freebuff (bajo bun.exe)
+];
 
 /// Un puerto TCP en escucha y el proceso que lo ocupa.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +49,11 @@ pub struct PortInfo {
     /// Línea de comandos completa del proceso (p. ej. `node ...\server.js`).
     /// `None` cuando no es legible (sistema/otro usuario) o el proceso murió.
     pub process_cmd: Option<String>,
+    /// Proyecto del área de trabajo al que pertenece el proceso: la carpeta
+    /// inmediatamente posterior a la raíz del workspace en su cmdline/ruta.
+    /// `None` cuando no cae en el workspace o no se puede resolver.
+    #[serde(default)]
+    pub proyecto: Option<String>,
 }
 
 impl PortInfo {
@@ -53,6 +65,7 @@ impl PortInfo {
             process_name: String::new(),
             process_path: None,
             process_cmd: None,
+            proyecto: None,
         }
     }
 
@@ -64,6 +77,7 @@ impl PortInfo {
             process_name: String::new(),
             process_path: None,
             process_cmd: None,
+            proyecto: None,
         }
     }
 }
@@ -90,13 +104,19 @@ pub fn scan_listeners() -> Result<Vec<PortInfo>, ScanError> {
     Ok(out)
 }
 
-/// Adjunta el nombre del proceso a cada fila usando una caché con TTL.
-pub fn attach_process_names(rows: &mut [PortInfo], cache: &mut NameCache) {
+/// Adjunta el nombre del proceso a cada fila usando una caché con TTL, y deriva
+/// el proyecto del área de trabajo desde el cmdline/ruta recién resueltos.
+pub fn attach_process_names(
+    rows: &mut [PortInfo],
+    cache: &mut NameCache,
+    cfg: &crate::config::Config,
+) {
     for row in rows.iter_mut() {
         let (name, path, cmd) = cache.get(row.pid);
         row.process_name = name;
         row.process_path = path;
         row.process_cmd = cmd;
+        row.proyecto = proyecto_para(row, cfg);
     }
 }
 
@@ -118,6 +138,53 @@ pub fn etiqueta_visible(row: &PortInfo) -> String {
         }
     }
     row.process_name.clone()
+}
+
+/// Proyecto del área de trabajo al que pertenece el proceso, derivado de su
+/// línea de comandos (y, si falta, de la ruta del ejecutable): la carpeta
+/// inmediatamente posterior a la raíz del workspace (`area-trabajo\gloryapi\…`
+/// → `gloryapi`). Nada hardcodeado: sale de la ruta real del proceso, así que
+/// si el proyecto cambia de carpeta la etiqueta cambia sola. Un alias manual
+/// de la config por puerto tiene prioridad sobre la derivación.
+pub fn proyecto_para(row: &PortInfo, cfg: &crate::config::Config) -> Option<String> {
+    if let Some(alias) = cfg.alias_para(row.port) {
+        return Some(alias.to_string());
+    }
+    let raiz = cfg.workspace_raiz();
+    for texto in [row.process_cmd.as_deref(), row.process_path.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(proyecto) = proyecto_en_ruta(texto, raiz) {
+            return Some(proyecto);
+        }
+    }
+    None
+}
+
+/// Primera carpeta tras la raíz del workspace en una ruta (case-insensitive).
+fn proyecto_en_ruta(texto: &str, raiz: &str) -> Option<String> {
+    let comps: Vec<&str> = texto.split(['\\', '/']).filter(|c| !c.is_empty()).collect();
+    comps
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(raiz))
+        .and_then(|i| comps.get(i + 1))
+        .map(|p| (*p).to_string())
+}
+
+/// Etiqueta de fila del popup: `Proyecto · proceso` cuando el proyecto se
+/// conoce, solo el proceso en caso contrario (app externa, sistema…).
+pub fn etiqueta_popup(row: &PortInfo) -> String {
+    let proceso = etiqueta_visible(row);
+    match row.proyecto.as_deref() {
+        Some(proyecto) if !proyecto.is_empty() => {
+            // Con el proyecto como prefijo, el `…\` del comienzo de la ruta es
+            // ruido: la ruta acortada se muestra sin él.
+            let proceso = proceso.strip_prefix("…\\").unwrap_or(&proceso);
+            format!("{proyecto} · {proceso}")
+        }
+        _ => proceso,
+    }
 }
 
 /// Primer argumento de la línea de comandos que parece un script (extensión
@@ -188,15 +255,20 @@ fn acortar_ruta(ruta: &str) -> String {
 /// blocklist. Esto oculta servicios del sistema (svchost, System, RPC…), procesos
 /// muertos/sin permiso ("desconocido") y sincronizadores (p. ej. GoogleDriveFS),
 /// que nunca deben cerrarse desde la bandeja.
-pub fn solo_aplicaciones(rows: Vec<PortInfo>) -> Vec<PortInfo> {
-    rows.into_iter().filter(es_puerto_de_aplicacion).collect()
+pub fn solo_aplicaciones(rows: Vec<PortInfo>, cfg: &crate::config::Config) -> Vec<PortInfo> {
+    rows.into_iter()
+        .filter(|r| es_puerto_de_aplicacion(r, cfg))
+        .collect()
 }
 
-fn es_puerto_de_aplicacion(row: &PortInfo) -> bool {
+fn es_puerto_de_aplicacion(row: &PortInfo, cfg: &crate::config::Config) -> bool {
     if row.port < 1024 {
         return false;
     }
     if esta_excluido(row) {
+        return false;
+    }
+    if esta_oculto_por_config(row, cfg) {
         return false;
     }
     row.process_path
@@ -204,9 +276,36 @@ fn es_puerto_de_aplicacion(row: &PortInfo) -> bool {
         .is_some_and(|p| !es_ruta_del_sistema(p))
 }
 
-/// ¿El proceso está en la blocklist? Compara nombre derivado y basename del path,
-/// case-insensitive, para cubrir también filas con nombre aún vacío.
+/// ¿El usuario marcó este puerto como oculto en la config? Matchea el proyecto
+/// derivado, el nombre del proceso, el basename del path y el script del cmdline,
+/// case-insensitive (p. ej. ocultar el proyecto `gloryapi` completo).
+fn esta_oculto_por_config(row: &PortInfo, cfg: &crate::config::Config) -> bool {
+    let mut candidatos: Vec<String> = Vec::with_capacity(4);
+    if let Some(proyecto) = row.proyecto.as_deref() {
+        candidatos.push(proyecto.to_string());
+    }
+    if !row.process_name.is_empty() {
+        candidatos.push(row.process_name.clone());
+    }
+    if let Some(path) = row.process_path.as_deref() {
+        if let Some(base) = path.rsplit('\\').next() {
+            candidatos.push(base.to_string());
+        }
+    }
+    if let Some(script) = row.process_cmd.as_deref().and_then(primer_script) {
+        if let Some(base) = script.rsplit(['\\', '/']).next() {
+            candidatos.push(base.to_string());
+        }
+    }
+    candidatos.iter().any(|c| cfg.esta_oculto(c))
+}
+
+/// ¿El proceso está en la blocklist? Compara el nombre derivado, el basename del
+/// path y el script de la línea de comandos (case-insensitive), para cubrir también
+/// filas con nombre aún vacío y procesos intérprete cuyo script es el que importa
+/// (p. ej. bun.exe sirviendo `orchestrator.js`).
 fn esta_excluido(row: &PortInfo) -> bool {
+    let mut candidatos: Vec<String> = Vec::with_capacity(2);
     let nombre = if row.process_name.is_empty() {
         row.process_path
             .as_deref()
@@ -215,9 +314,17 @@ fn esta_excluido(row: &PortInfo) -> bool {
     } else {
         row.process_name.as_str()
     };
-    PROCESOS_EXCLUIDOS
-        .iter()
-        .any(|excluido| nombre.eq_ignore_ascii_case(excluido))
+    candidatos.push(nombre.to_string());
+    if let Some(script) = row.process_cmd.as_deref().and_then(primer_script) {
+        if let Some(base) = script.rsplit(['\\', '/']).next() {
+            candidatos.push(base.to_string());
+        }
+    }
+    candidatos.iter().any(|candidato| {
+        PROCESOS_EXCLUIDOS
+            .iter()
+            .any(|excluido| candidato.eq_ignore_ascii_case(excluido))
+    })
 }
 
 /// ¿La ruta está dentro de la carpeta Windows del sistema (case-insensitive)?
@@ -390,14 +497,13 @@ fn decode_port(raw: u32) -> u16 {
     u16::from_be((raw & 0xFFFF) as u16)
 }
 
+/// `MIB_TCPROW.dwLocalAddr` viene como valor `inet_addr` (primer octeto en el
+/// byte bajo), así que los octetos en memoria ya están en orden de puntos
+/// (`7F 00 00 01` para 127.0.0.1). Formatear los bytes nativos reproduce
+/// exactamente ese orden sin importar la endianness de la máquina.
 fn ipv4_to_string(raw: u32) -> String {
-    format!(
-        "{}.{}.{}.{}",
-        (raw >> 24) & 0xFF,
-        (raw >> 16) & 0xFF,
-        (raw >> 8) & 0xFF,
-        raw & 0xFF
-    )
+    let [a, b, c, d] = raw.to_ne_bytes();
+    format!("{a}.{b}.{c}.{d}")
 }
 
 /// Formato IPv6 con compresión básica de la corrida más larga de ceros (`::`),
@@ -468,7 +574,7 @@ mod tests {
 
     #[test]
     fn ipv4_formatting() {
-        assert_eq!(ipv4_to_string(0x7F00_0001), "127.0.0.1");
+        assert_eq!(ipv4_to_string(0x0100_007F), "127.0.0.1");
         assert_eq!(ipv4_to_string(0), "0.0.0.0");
     }
 
@@ -503,6 +609,7 @@ mod tests {
                 process_name: String::new(),
                 process_path: None,
                 process_cmd: None,
+                proyecto: None,
             },
             PortInfo {
                 port: 80,
@@ -511,6 +618,7 @@ mod tests {
                 process_name: String::new(),
                 process_path: None,
                 process_cmd: None,
+                proyecto: None,
             },
             PortInfo {
                 port: 3000,
@@ -519,6 +627,7 @@ mod tests {
                 process_name: String::new(),
                 process_path: None,
                 process_cmd: None,
+                proyecto: None,
             },
             PortInfo {
                 port: 3000,
@@ -527,6 +636,7 @@ mod tests {
                 process_name: String::new(),
                 process_path: None,
                 process_cmd: None,
+                proyecto: None,
             },
         ];
         dedupe_and_sort(&mut rows);
@@ -556,6 +666,7 @@ mod tests {
                 process_name: String::new(),
                 process_path: path.map(str::to_string),
                 process_cmd: None,
+                proyecto: None,
             }
         }
 
@@ -573,9 +684,19 @@ mod tests {
                 7679,
                 Some(r"C:\Program Files\Google\Drive File Stream\GoogleDriveFS.exe"),
             ), // sincronizador excluido por blocklist
+            row(
+                49351,
+                Some(r"C:\Program Files\Intel\SUR\QUEENCREEK\x64\esrv.exe"),
+            ), // Intel: no debe ofrecerse
+            row(
+                59489,
+                Some(
+                    r"C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\Freebuff.exe",
+                ),
+            ), // la propia app Freebuff
         ];
 
-        let kept = solo_aplicaciones(rows);
+        let kept = solo_aplicaciones(rows, &crate::config::Config::default());
         let kept_ports: Vec<u16> = kept.iter().map(|r| r.port).collect();
         assert_eq!(kept_ports, vec![3000, 5432]);
 
@@ -585,7 +706,39 @@ mod tests {
             Some(r"C:\Program Files\Google\Drive File Stream\GoogleDriveFS.exe"),
         );
         fila_google.process_name = "GoogleDriveFS.exe".into();
-        assert!(!es_puerto_de_aplicacion(&fila_google));
+        assert!(!es_puerto_de_aplicacion(
+            &fila_google,
+            &crate::config::Config::default()
+        ));
+
+        // El orchestrator de Freebuff corre bajo bun.exe: la blocklist debe
+        // casar con el script del cmdline, no con el ejecutable.
+        let mut orquestador = row(
+            59494,
+            Some(
+                r"C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\resources\bun\bun.exe",
+            ),
+        );
+        orquestador.process_name = "bun.exe".into();
+        orquestador.process_cmd = Some(
+            r"C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\resources\bun\bun.exe C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\resources\orchestrator\orchestrator.js"
+                .to_string(),
+        );
+        assert!(!es_puerto_de_aplicacion(
+            &orquestador,
+            &crate::config::Config::default()
+        ));
+
+        // Ocultar por proyecto desde la config (p. ej. gloryapi) sin tocar el binario.
+        let mut cfg_oculta = crate::config::Config::default();
+        cfg_oculta.ocultar.push("gloryapi".into());
+        let mut fila_gloryapi = row(3101, Some(r"C:\Program Files\nodejs\node.exe"));
+        fila_gloryapi.proyecto = Some("gloryapi".into());
+        assert!(es_puerto_de_aplicacion(
+            &fila_gloryapi,
+            &crate::config::Config::default()
+        ));
+        assert!(!es_puerto_de_aplicacion(&fila_gloryapi, &cfg_oculta));
     }
 
     #[test]
@@ -598,6 +751,7 @@ mod tests {
                 process_name: name.into(),
                 process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
                 process_cmd: cmd.map(str::to_string),
+                proyecto: None,
             }
         }
 
@@ -637,5 +791,111 @@ mod tests {
         // Sin línea de comandos: cae al nombre del ejecutable.
         let sin_cmd = row("node.exe", None);
         assert_eq!(etiqueta_visible(&sin_cmd), "node.exe");
+    }
+
+    #[test]
+    fn proyecto_se_deriva_del_cmdline() {
+        let cfg = crate::config::Config::default();
+        fn row(cmd: Option<&str>, path: Option<&str>) -> PortInfo {
+            PortInfo {
+                port: 3101,
+                pid: 1000,
+                address: "127.0.0.1".into(),
+                process_name: "node.exe".into(),
+                process_path: path.map(str::to_string),
+                process_cmd: cmd.map(str::to_string),
+                proyecto: None,
+            }
+        }
+
+        // cmdline con ruta del script dentro del workspace.
+        let gloryapi = row(
+            Some(
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\Owner\OneDrive\Documentos\area-trabajo\gloryapi\server\dist\index.js"#,
+            ),
+            Some(r"C:\Program Files\nodejs\node.exe"),
+        );
+        assert_eq!(proyecto_para(&gloryapi, &cfg).as_deref(), Some("gloryapi"));
+
+        // Case-insensitive y carpetas con espacios: PROYECTO TASKS.
+        let tasks = row(
+            Some(
+                r#""node" "C:\Users\Owner\OneDrive\Documentos\AREA-TRABAJO\PROYECTO TASKS\frontend\node_modules\.bin\..\vite\bin\vite.js""#,
+            ),
+            None,
+        );
+        assert_eq!(
+            proyecto_para(&tasks, &cfg).as_deref(),
+            Some("PROYECTO TASKS")
+        );
+
+        // Fuera del workspace (Freebuff, Intel…): sin proyecto.
+        let externo = row(
+            Some(r"C:\Users\Owner\AppData\Local\Programs\@codebufffreebuff-desktop\Freebuff.exe"),
+            None,
+        );
+        assert_eq!(proyecto_para(&externo, &cfg), None);
+
+        // Sin cmdline ni ruta resoluble.
+        let sin_datos = row(None, None);
+        assert_eq!(proyecto_para(&sin_datos, &cfg), None);
+    }
+
+    #[test]
+    fn alias_de_config_y_workspace_personalizado() {
+        let row = |port: u16, cmd: &str| PortInfo {
+            port,
+            pid: 1000,
+            address: "127.0.0.1".into(),
+            process_name: "node.exe".into(),
+            process_path: None,
+            process_cmd: Some(cmd.to_string()),
+            proyecto: None,
+        };
+
+        // Alias manual por puerto: prioridad sobre la derivación.
+        let cfg: crate::config::Config =
+            serde_json::from_str(r#"{"nombres": {"3000": "Tasks backend"}}"#).unwrap();
+        let backend = row(
+            3000,
+            r"C:\tmp\glory-target\glory_backend_main\debug\glory-backend.exe",
+        );
+        assert_eq!(
+            proyecto_para(&backend, &cfg).as_deref(),
+            Some("Tasks backend")
+        );
+
+        // Raíz de workspace personalizada vía config.
+        let cfg2: crate::config::Config =
+            serde_json::from_str(r#"{"workspace": "proyectos"}"#).unwrap();
+        let web = row(4100, r"C:\dev\proyectos\webapp\server\index.js");
+        assert_eq!(proyecto_para(&web, &cfg2).as_deref(), Some("webapp"));
+        // Con la raíz por defecto no se reconoce esa ruta.
+        assert_eq!(proyecto_para(&web, &crate::config::Config::default()), None);
+    }
+
+    #[test]
+    fn etiqueta_popup_prefiere_proyecto() {
+        let mut row = PortInfo {
+            port: 4100,
+            pid: 1000,
+            address: "127.0.0.1".into(),
+            process_name: "node.exe".into(),
+            process_path: Some(r"C:\Program Files\nodejs\node.exe".into()),
+            process_cmd: Some(
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\Owner\OneDrive\Documentos\area-trabajo\gloryapi\integrations\codex-bridge\bridge\server.js"#
+                    .to_string(),
+            ),
+            proyecto: None,
+        };
+        row.proyecto = Some("gloryapi".into());
+        assert_eq!(
+            etiqueta_popup(&row),
+            "gloryapi · codex-bridge\\bridge\\server.js"
+        );
+
+        // Sin proyecto: igual que la etiqueta normal.
+        row.proyecto = None;
+        assert_eq!(etiqueta_popup(&row), etiqueta_visible(&row));
     }
 }

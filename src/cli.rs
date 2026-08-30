@@ -68,10 +68,11 @@ fn cmd_list(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    ports::attach_process_names(&mut rows, &mut ports::NameCache::new());
+    let cfg = crate::config::Config::load();
+    ports::attach_process_names(&mut rows, &mut ports::NameCache::new(), &cfg);
     // Por defecto solo aplicaciones de usuario; el sistema se ve con --incluir-sistema.
     if !include_system {
-        rows = ports::solo_aplicaciones(rows);
+        rows = ports::solo_aplicaciones(rows, &cfg);
     }
 
     if json {
@@ -83,13 +84,20 @@ fn cmd_list(args: &[String]) -> ExitCode {
             }
         }
     } else {
-        outln!("{:<7} {:<21} {:<8} PROCESO", "PUERTO", "DIRECCIÓN", "PID");
+        outln!(
+            "{:<7} {:<21} {:<8} {:<22} PROCESO",
+            "PUERTO",
+            "DIRECCIÓN",
+            "PID",
+            "PROYECTO"
+        );
         for row in &rows {
             outln!(
-                "{:<7} {:<21} {:<8} {}",
+                "{:<7} {:<21} {:<8} {:<22} {}",
                 row.port,
                 row.address,
                 row.pid,
+                row.proyecto.as_deref().unwrap_or("-"),
                 ports::etiqueta_visible(row)
             );
         }
@@ -148,7 +156,8 @@ fn cmd_kill(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    ports::attach_process_names(&mut rows, &mut ports::NameCache::new());
+    let cfg = crate::config::Config::load();
+    ports::attach_process_names(&mut rows, &mut ports::NameCache::new(), &cfg);
     let targets: Vec<_> = rows
         .into_iter()
         .filter(|r| r.port == port && pid_filter.is_none_or(|pid| r.pid == pid))

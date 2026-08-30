@@ -27,7 +27,7 @@ embebidas), compacto y pintado con GDI:
 - CLI para scripting: `list` (tabla o JSON, con `--incluir-sistema` para ver todo) y
   `kill <puerto>` con exit codes.
 - Bajo consumo: sin refresco automático, ~0 % CPU en reposo, ~1,5–2,5 MB de RAM privada en
-  bandeja (WorkingSet ~10–17 MB según el sistema), binario release de ~348 KB (0,34 MB).
+  bandeja (WorkingSet ~10–17 MB según el sistema), binario release de ~358 KB (0,35 MB).
 
 ## Requisitos
 
@@ -62,8 +62,11 @@ popup incluye:
 Si hay más de 60 puertos, el popup se desplaza con la rueda del ratón (máx. 9 filas
 visibles). No hay cabecera ni contador: el popup es compacto y se abre sobre el cursor.
 El cursor se mantiene como flecha al pasar por encima (sin el cursor de espera que
-aparecía antes) y, si la ruta del proceso no cabe en la fila, se recorta por el principio
-conservando el final (`…\codex-bridge\bridge\server.js` en vez de cortar la cola).
+aparecía antes). Con 430 px de ancho, si la ruta completa cabe en la fila se muestra
+entera; si no, se recorta por el principio conservando el final
+(`…\codex-bridge\bridge\server.js`). Al pasar el ratón por una fila, un **tooltip**
+muestra la ruta completa, y el clic (izquierdo o derecho) en el icono de la bandeja abre
+el popup.
 
 ### Filtro de aplicaciones
 
@@ -131,10 +134,10 @@ Exit codes: `0` éxito, `1` error de ejecución (p. ej. puerto libre o acceso de
 | `cargo test` | 24/24 OK (21 unit + 3 E2E con puerto real) |
 | `cargo clippy --all-targets -- -D warnings` | OK |
 | `cargo fmt --check` | OK |
-| Smoke bandeja | Icono en bandeja; clic físico abre el popup 340×400 en < 130 ms, estable, 2.º clic cierra sin reabrir |
+| Smoke bandeja | Icono en bandeja; clic físico (izq. o der.) abre el popup 430×436 en < 130 ms, estable, 2.º clic cierra sin reabrir |
 | RAM en bandeja | WorkingSet ~10 MB / privada ~1,5 MB, 4 hilos |
 | `gloryport list` (release) | instantáneo con el filtro de aplicaciones |
-| Binario release | 350.208 bytes (~342 KB), autocontenido (icono + fuentes) |
+| Binario release | 357.888 bytes (~350 KB), autocontenido (icono + fuentes) |
 
 ## Límites conocidos
 

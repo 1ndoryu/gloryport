@@ -1,4 +1,5 @@
 /target/
+.cargo/config.toml
 *.pdb
 .DS_Store
 Thumbs.db

@@ -6,6 +6,7 @@
 
 mod autostart;
 mod cli;
+mod config;
 mod fonts;
 mod icon;
 mod popup;
