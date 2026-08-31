@@ -216,6 +216,17 @@ struct ToolTi(TTTOOLINFOW);
 unsafe impl Send for ToolTi {}
 
 static STATE: Mutex<Option<PopupState>> = Mutex::new(None);
+
+/// Bloquea `STATE` recuperándose del envenenamiento del mutex: si otra hebra
+/// paniqueó mientras lo sostenía, `into_inner()` rescata el dato en vez de
+/// propagar el panic y tumbar el popup de producción.
+fn lock_state() -> std::sync::MutexGuard<'static, Option<PopupState>> {
+    match STATE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 /// Cursor de flecha del popup (raw `usize` porque `HCURSOR` no es `Sync`): evita
 /// que el sistema deje el cursor previo del hilo (p. ej. el de espera) cuando la
@@ -258,7 +269,7 @@ static UI: LazyLock<Ui> = LazyLock::new(|| unsafe {
 
 /// Muestra el popup modal en el cursor y devuelve la acción elegida (bloqueante).
 pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
-    if STATE.lock().unwrap().is_some() {
+    if lock_state().is_some() {
         // Popup ya abierto: reentrada del mismo hilo (clic en bandeja), se ignora.
         return Action::None;
     }
@@ -316,7 +327,7 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
             state.tooltip = Some(hwnd_tooltip.0 as usize);
             state.tool_ti = Some(tool_ti);
         }
-        *STATE.lock().unwrap() = Some(state);
+        *lock_state() = Some(state);
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetForegroundWindow(hwnd);
@@ -346,13 +357,10 @@ pub fn show(owner: HWND, ports: Vec<PortInfo>, autostart_on: bool) -> Action {
             PostQuitMessage(code);
         }
     }
-    let action = STATE
-        .lock()
-        .unwrap()
+    lock_state()
         .take()
         .and_then(|s| s.action)
-        .unwrap_or(Action::None);
-    action
+        .unwrap_or(Action::None)
 }
 
 /// Registra el cierre del popup con la hora actual (ms desde la época).
@@ -383,7 +391,7 @@ fn was_recent(now_ms: u64, last_ms: u64, within_ms: u64) -> bool {
 
 /// ¿Hay un popup abierto en este momento?
 pub fn is_open() -> bool {
-    STATE.lock().unwrap().is_some()
+    lock_state().is_some()
 }
 
 /// Cierra el popup activo sin acción (p. ej. segundo clic en el icono de bandeja).
@@ -402,7 +410,7 @@ pub fn cancel_active() {
 
 /// Destruye el tooltip de filas (hijo del popup) si sigue vivo.
 unsafe fn destroy_row_tooltip() -> bool {
-    let guard = STATE.lock().unwrap();
+    let guard = lock_state();
     let Some(tooltip) = guard.as_ref().and_then(|s| s.tooltip) else {
         return false;
     };
@@ -628,7 +636,7 @@ fn on_mousemove(hwnd: HWND, lparam: LPARAM) {
 
 fn on_wheel(wparam: WPARAM) {
     let delta = ((wparam.0 >> 16) as u16) as i16 as i32;
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     if let Some(s) = guard.as_mut() {
         let layout = Layout::new(s.ports.len());
         let next = scroll_step(s.scroll, delta, layout.max_scroll);
@@ -664,7 +672,7 @@ fn on_notify(lparam: LPARAM) -> bool {
             return false;
         }
         let info = &mut *(lparam.0 as *mut NMTTDISPINFOW);
-        let guard = STATE.lock().unwrap();
+        let guard = lock_state();
         let Some(state) = guard.as_ref() else {
             return false;
         };
@@ -690,7 +698,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) {
     if vk == VK_ESCAPE.0 {
         finish(hwnd, Action::None);
     } else if vk == VK_RETURN.0 {
-        let hit = STATE.lock().unwrap().as_ref().and_then(|s| s.hover);
+        let hit = lock_state().as_ref().and_then(|s| s.hover);
         finish(hwnd, action_for(hit.unwrap_or(Hit::None)));
     }
 }
@@ -698,9 +706,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) {
 fn action_for(hit: Hit) -> Action {
     match hit {
         Hit::None => Action::None,
-        Hit::Row(idx) => STATE
-            .lock()
-            .unwrap()
+        Hit::Row(idx) => lock_state()
             .as_ref()
             .and_then(|s| s.ports.get(idx).cloned())
             .map(Action::Kill)
@@ -713,7 +719,7 @@ fn action_for(hit: Hit) -> Action {
 /// Registra la acción, marca `done` (evita doble cierre) y despierta el bucle modal.
 fn finish(hwnd: HWND, action: Action) {
     {
-        let mut guard = STATE.lock().unwrap();
+        let mut guard = lock_state();
         if let Some(s) = guard.as_mut() {
             if s.done {
                 return;
@@ -728,7 +734,7 @@ fn finish(hwnd: HWND, action: Action) {
 }
 
 fn arm_track_leave(hwnd: HWND) {
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     if let Some(s) = guard.as_mut() {
         if s.tracking {
             return;
@@ -745,14 +751,14 @@ fn arm_track_leave(hwnd: HWND) {
 }
 
 fn untrack() {
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     if let Some(s) = guard.as_mut() {
         s.tracking = false;
     }
 }
 
 fn set_hover(hwnd: HWND, hit: Option<Hit>) {
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     let Some(s) = guard.as_mut() else {
         return;
     };
@@ -817,7 +823,7 @@ fn set_hover(hwnd: HWND, hit: Option<Hit>) {
 }
 
 fn current_hit(x: i32, y: i32) -> Hit {
-    let guard = STATE.lock().unwrap();
+    let guard = lock_state();
     guard.as_ref().map_or(Hit::None, |s| {
         let layout = Layout::new(s.ports.len());
         hit_test((x, y), &layout, s.scroll, s.ports.len())
