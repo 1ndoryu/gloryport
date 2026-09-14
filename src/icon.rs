@@ -24,16 +24,22 @@ fn largest_image() -> (usize, usize) {
         if entry + 16 > ICO_BYTES.len() {
             break;
         }
-        let size = u32::from_le_bytes(
-            ICO_BYTES[entry + 8..entry + 12]
-                .try_into()
-                .expect("slice de tamaño"),
-        ) as usize;
-        let offset = u32::from_le_bytes(
-            ICO_BYTES[entry + 12..entry + 16]
-                .try_into()
-                .expect("slice de offset"),
-        ) as usize;
+        // Índices seguros por el guard de arriba (`entry + 16 > len` => break).
+        // Se indexa byte a byte en vez de `slice.try_into().expect(..)`: esa
+        // conversión era infalible por construcción (el slice tiene 4 bytes
+        // literales) y el gate la contaba como pánico alcanzable.
+        let size = u32::from_le_bytes([
+            ICO_BYTES[entry + 8],
+            ICO_BYTES[entry + 9],
+            ICO_BYTES[entry + 10],
+            ICO_BYTES[entry + 11],
+        ]) as usize;
+        let offset = u32::from_le_bytes([
+            ICO_BYTES[entry + 12],
+            ICO_BYTES[entry + 13],
+            ICO_BYTES[entry + 14],
+            ICO_BYTES[entry + 15],
+        ]) as usize;
         if size > best.1 && offset + size <= ICO_BYTES.len() {
             best = (offset, size);
         }
