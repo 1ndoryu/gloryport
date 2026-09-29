@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 // Errores explícitos en vez de `expect`: el helper solo existe para las pruebas
-// E2E, pero el gate mide todo `src/` como producción, y un pánico no distingue
+// E2E, pero el gate mide `src/` completo como producción, y un pánico no distingue
 // "faltó el argumento" de "el puerto está ocupado". Con `Result` el fallo sale
 // por stderr con código != 0 (lo que consume `tests/cli.rs`) y queda registrado.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
