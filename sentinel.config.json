@@ -11,8 +11,8 @@
     "directCommands": {
       "npmScripts": [],
       "npxTools": [],
-      "cargoSubcommands": ["check", "test", "clippy", "fmt"],
-      "tools": ["git"]
+      "cargoSubcommands": ["check", "test", "clippy", "fmt", "bench", "nextest"],
+      "tools": []
     }
   },
   "analyzers": {
