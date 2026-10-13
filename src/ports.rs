@@ -510,8 +510,10 @@ fn ipv4_to_string(raw: u32) -> String {
 /// suficiente para identificación en menú/tooltip.
 fn ipv6_to_string(addr: &[u8; 16]) -> String {
     let groups: Vec<u16> = addr
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
         .collect();
 
     // Corrida más larga de grupos cero (mínimo 2 para que valga la pena comprimir).
