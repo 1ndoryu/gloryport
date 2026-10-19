@@ -7,3 +7,6 @@ Thumbs.db
 .sentinel/
 # Informes generados por el gate (Sentinel); no se versionan
 .quality-reports/
+
+# Documentacion local del area (planes, tareas, lecciones): fuera del repo publico.
+Agente/
