@@ -11,9 +11,6 @@ decisión: `docs/arquitectura.md`.
   notificaciones).
 - [ ] `128A-9` — **Declarar `rust-version` en `Cargo.toml`** (rápida). El código usa `is_none_or`,
   así que el MSRV real es 1.82+; la elipsis del PID ya quedó resuelta en `128A-10`.
-- [ ] `128A-13` — **Fix IPv4 invertido en `list`** (rápida). `ports.rs` imprime el `u32` sin
-  `u32::from_be` (muestra `1.0.0.127` en vez de `127.0.0.1`); el test alimenta el valor ya en BE y
-  lo enmascara. Arreglar con `u32::from_be` y un test con el valor real de la API (`0x0100_007F`).
 - [ ] `128A-5` — **Re-verificar puerto y PID justo antes de matar desde el menú** (rápida), para no
   matar un PID reutilizado entre la apertura del menú y el clic.
 - [ ] `128A-14` — **Vía de salida por UI** (rápida): «Salir» en el menú contextual de la bandeja, y
