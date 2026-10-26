@@ -293,6 +293,19 @@ unsafe fn show_menu(hwnd: HWND) {
 }
 
 fn handle_kill(hwnd: HWND, row: &PortInfo) {
+    // [por qué] El menú pudo abrirse hace rato: se re-verifica puerto y PID antes de matar.
+    if !ports::sigue_escuchando(row.port, row.pid) {
+        notify(
+            hwnd,
+            "No se pudo liberar el puerto",
+            &format!(
+                "Puerto {}: el proceso ya no escucha en él (PID {}). No se terminó nada.",
+                row.port, row.pid
+            ),
+            NIIF_ERROR,
+        );
+        return;
+    }
     match process::kill_pid(row.pid) {
         Ok(()) => notify(
             hwnd,
