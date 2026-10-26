@@ -2,6 +2,8 @@
 name = "gloryport"
 version = "0.1.0"
 edition = "2021"
+# MSRV real: `Option::is_none_or` (cli.rs) se estabilizó en 1.82.
+rust-version = "1.82"
 description = "Gestor minimalista de puertos TCP para Windows, desde la bandeja del sistema"
 license = "MIT"
 
