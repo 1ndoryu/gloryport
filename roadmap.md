@@ -6,17 +6,14 @@ decisión: `docs/arquitectura.md`.
 
 ## Siguiente bloque
 
-- [ ] `19AA-1` — **Validar la v1 en uso real.** Correr `gloryport tray` durante varios días, matar
-  puertos en proyectos diarios y registrar cualquier fricción (faltan PIDs, permisos,
-  notificaciones).
-- [ ] `128A-9` — **Declarar `rust-version` en `Cargo.toml`** (rápida). El código usa `is_none_or`,
-  así que el MSRV real es 1.82+; la elipsis del PID ya quedó resuelta en `128A-10`.
-- [ ] `128A-5` — **Re-verificar puerto y PID justo antes de matar desde el menú** (rápida), para no
-  matar un PID reutilizado entre la apertura del menú y el clic.
+Nada en cola.
+
 ## Pendientes
 
 Ninguno.
 
 ## Bloqueos
+
+- Bloqueo `19AA-1` — validar la v1 en uso real: depende de la usuaria (varios días con `gloryport tray` en proyectos diarios). Se reabre si aparece fricción (faltan PIDs, permisos, notificaciones).
 
 ## Planes activos
