@@ -95,6 +95,14 @@ impl std::fmt::Display for ScanError {
     }
 }
 
+/// Comprueba que `pid` siga escuchando en `port` ahora mismo.
+/// [por qué] Entre abrir el menú y el clic el PID puede haberse reutilizado; si el escaneo falla, no se mata (fail-closed).
+pub fn sigue_escuchando(port: u16, pid: u32) -> bool {
+    scan_listeners()
+        .map(|rows| rows.iter().any(|r| r.port == port && r.pid == pid))
+        .unwrap_or(false)
+}
+
 /// Escanea todos los puertos TCP en escucha (IPv4 + IPv6), deduplicados y ordenados.
 pub fn scan_listeners() -> Result<Vec<PortInfo>, ScanError> {
     let mut out = Vec::new();
